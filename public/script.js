@@ -71,7 +71,6 @@ class RagzzyChatApp {
         this.setupEventListeners();
         this.loadSettings();
         this.updateWelcomeTime();
-        this.loadGuidedPrompts();
         this.updateCharCounter();
         this.checkOnlineStatus();
         
@@ -100,18 +99,6 @@ class RagzzyChatApp {
             }
         });
         
-        // Knowledge contribution events
-        if (this.elements.startContributing) {
-            this.elements.startContributing.addEventListener('click', () => {
-                this.showContributionModal();
-            });
-        }
-        
-        if (this.elements.skipPrompts) {
-            this.elements.skipPrompts.addEventListener('click', () => {
-                this.hideKnowledgePrompt();
-            });
-        }
         
         if (this.elements.closeContribution) {
             this.elements.closeContribution.addEventListener('click', () => {
@@ -324,7 +311,7 @@ class RagzzyChatApp {
             
             // Handle contribution prompt if present and enabled in settings
             if (response.contributionPrompt && response.contributionPrompt.show && this.contributionsEnabled) {
-                this.showContributionPrompt(response.contributionPrompt.message, message);
+                this.showContributionLink(response.contributionPrompt.message);
             }
             
         } catch (error) {
@@ -434,7 +421,7 @@ class RagzzyChatApp {
         });
     }
     
-    showContributionPrompt(message, originalQuestion) {
+    showContributionLink(message) {
         const promptDiv = document.createElement('div');
         promptDiv.className = 'contribution-prompt';
         promptDiv.innerHTML = `
@@ -442,7 +429,7 @@ class RagzzyChatApp {
             <p>${message}</p>
             <div class="contribution-actions">
                 <button class="btn btn-secondary" onclick="this.parentElement.parentElement.remove()">Not now</button>
-                <button class="btn btn-primary" onclick="ragzzyApp.showContributionModal(\`${originalQuestion.replace(/'/g, "\\'")}\`)">Help Out</button>
+                <a href="contributions.html" class="btn btn-primary">Share Knowledge</a>
             </div>
         `;
         
@@ -647,64 +634,6 @@ class RagzzyChatApp {
         }
     }
     
-    loadGuidedPrompts() {
-        // Default guided prompts - in a real app, these might come from the API
-        this.guidedPrompts = [
-            {
-                id: 'business-hours',
-                question: 'What are your business hours?',
-                category: 'business-info',
-                required: true
-            },
-            {
-                id: 'contact-info',
-                question: 'How can customers contact support?',
-                category: 'business-info',
-                required: true
-            },
-            {
-                id: 'main-products',
-                question: 'What are your main products or services?',
-                category: 'products',
-                required: true
-            },
-            {
-                id: 'pricing-info',
-                question: 'What is your pricing structure?',
-                category: 'pricing',
-                required: false
-            },
-            {
-                id: 'return-policy',
-                question: 'What is your return/refund policy?',
-                category: 'policies',
-                required: false
-            }
-        ];
-        
-        // Show knowledge prompt after a delay
-        setTimeout(() => {
-            this.showKnowledgePrompt();
-        }, 5000);
-    }
-    
-    showKnowledgePrompt() {
-        if (!this.contributionsEnabled) {
-            return;
-        }
-        
-        const guidedPromptsHtml = this.guidedPrompts.map(prompt => 
-            `<div class="guided-prompt-item ${prompt.required ? 'required' : ''}" onclick="ragzzyApp.showContributionModal(\`${prompt.question.replace(/'/g, "\\'")}\`)">                ${prompt.question}            </div>`
-        ).join('');
-        
-        document.getElementById('guidedPrompts').innerHTML = guidedPromptsHtml;
-        this.elements.knowledgePrompt.style.display = 'block';
-        this.scrollToBottom();
-    }
-    
-    hideKnowledgePrompt() {
-        this.elements.knowledgePrompt.style.display = 'none';
-    }
     
     showError(message) {
         this.elements.errorMessage.textContent = message;
@@ -1033,11 +962,6 @@ class RagzzyChatApp {
     }
     
     hideAllContributionPrompts() {
-        // Hide knowledge prompt
-        if (this.elements.knowledgePrompt) {
-            this.elements.knowledgePrompt.style.display = 'none';
-        }
-        
         // Remove contribution prompts from messages
         const contributionPrompts = document.querySelectorAll('.contribution-prompt');
         contributionPrompts.forEach(prompt => {
