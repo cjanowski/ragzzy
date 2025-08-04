@@ -1,4 +1,4 @@
-# RagZzy — Retrieval‑Augmented Support Assistant (Employer Showcase)
+# RagZzy — Retrieval‑Augmented Support Assistant
 
 RagZzy is a modern, retrieval‑augmented support assistant that blends semantic + keyword retrieval, dynamic few‑shot prompting, and a post‑generation validator with an optional single‑revision loop. It’s built to demonstrate strong product thinking, pragmatic engineering, and measurable quality.
 
@@ -10,6 +10,7 @@ RagZzy is a modern, retrieval‑augmented support assistant that blends semantic
 - Offline eval CLI: run local evaluations against seeds, report structure adherence and coverage metrics, export JSONL for analysis.
 
 This project showcases: retrieval architectures, prompt engineering, safety/consistency checks, async streaming, and pragmatic tooling for evaluation.
+<img width="1512" height="822" alt="Screenshot 2025-08-04 at 6 49 33 PM" src="https://github.com/user-attachments/assets/967041d5-6710-40bb-951f-eb1462e0b80a" />
 
 ---
 
