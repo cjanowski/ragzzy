@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RagZzy - Knowledge Contributions</title>
+    <meta name="description" content="Help improve RagZzy by contributing your knowledge and expertise.">
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="contributions-style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="contributions-page">
+    <!-- Visual Enhancement Elements -->
+    <div class="shooting-stars" id="shootingStars"></div>
+    <div class="sparkles" id="sparkles"></div>
+    <div class="floating-particles" id="floatingParticles"></div>
+    
+    <div class="contributions-container">
+        <!-- Header -->
+        <header class="contributions-header">
+            <div class="header-content">
+                <div class="logo-section">
+                    <div class="logo">🧠</div>
+                    <div class="header-text">
+                        <h1>Knowledge Hub</h1>
+                        <p class="header-subtitle">Help make RagZzy smarter by sharing your expertise</p>
+                    </div>
+                </div>
+                <div class="header-actions">
+                    <a href="index.html" class="btn btn-secondary">
+                        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="width: 16px; height: 16px; margin-right: 0.5rem;">
+                            <path d="M19 12H5M5 12L12 19M5 12L12 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        Back to Chat
+                    </a>
+                    <div class="status-indicator">
+                        <div class="status-dot online" id="statusDot"></div>
+                        <span class="status-text" id="statusText">Online</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="contributions-main">
+            <!-- Welcome Section -->
+            <section class="welcome-section">
+                <div class="welcome-card">
+                    <h2>🌟 Help Build the Knowledge Base</h2>
+                    <p>Your contributions make RagZzy more helpful for everyone. Share what you know and help create a better support experience.</p>
+                    <div class="stats-row">
+                        <div class="stat-item">
+                            <span class="stat-number" id="totalContributions">0</span>
+                            <span class="stat-label">Total Contributions</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-number" id="yourContributions">0</span>
+                            <span class="stat-label">Your Contributions</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-number" id="helpfulVotes">0</span>
+                            <span class="stat-label">Helpful Votes</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Quick Contribute Section -->
+            <section class="quick-contribute-section">
+                <div class="section-header">
+                    <h3>⚡ Quick Contribute</h3>
+                    <p>Answer these commonly asked questions to help other users</p>
+                </div>
+                <div class="quick-prompts" id="quickPrompts">
+                    <!-- Quick prompts will be loaded here -->
+                </div>
+            </section>
+
+            <!-- Detailed Contribution Form -->
+            <section class="detailed-contribute-section">
+                <div class="section-header">
+                    <h3>📝 Add Detailed Knowledge</h3>
+                    <p>Contribute comprehensive information on any topic</p>
+                </div>
+                <div class="contribution-form-container">
+                    <form id="detailedContributionForm" class="detailed-form">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="detailedQuestion">Question or Topic:</label>
+                                <input type="text" id="detailedQuestion" name="question" placeholder="What question are you answering?" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="detailedCategory">Category:</label>
+                                <select id="detailedCategory" name="category" required>
+                                    <option value="">Select a category</option>
+                                    <option value="business-info">Business Information</option>
+                                    <option value="products">Products & Services</option>
+                                    <option value="pricing">Pricing</option>
+                                    <option value="policies">Policies</option>
+                                    <option value="support">Support & How-to</option>
+                                    <option value="technical">Technical Information</option>
+                                    <option value="other">Other</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="detailedAnswer">Detailed Answer:</label>
+                            <textarea id="detailedAnswer" name="answer" placeholder="Provide a comprehensive answer..." required rows="6"></textarea>
+                            <div class="char-counter">
+                                <span id="detailedCharCount">0</span> / 5000 characters
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="detailedTags">Tags (optional):</label>
+                                <input type="text" id="detailedTags" name="tags" placeholder="e.g., billing, account, troubleshooting">
+                                <small>Separate multiple tags with commas</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="detailedConfidence">Confidence Level:</label>
+                                <div class="confidence-slider">
+                                    <input type="range" id="detailedConfidence" name="confidence" min="1" max="5" value="4">
+                                    <div class="confidence-labels">
+                                        <span>Not sure</span>
+                                        <span>Very confident</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-secondary" id="clearForm">Clear Form</button>
+                            <button type="submit" class="btn btn-primary" id="submitDetailed">
+                                <span class="btn-text">Add Knowledge</span>
+                                <span class="btn-loading" style="display: none;">Adding...</span>
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </section>
+
+            <!-- Recent Contributions -->
+            <section class="recent-contributions-section">
+                <div class="section-header">
+                    <h3>📚 Recent Contributions</h3>
+                    <p>Knowledge recently added by the community</p>
+                </div>
+                <div class="contributions-list" id="recentContributions">
+                    <!-- Recent contributions will be loaded here -->
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Success Toast -->
+    <div class="toast success-toast" id="successToast" style="display: none;" role="alert" aria-live="polite">
+        <div class="toast-content">
+            <span class="toast-icon">✅</span>
+            <span class="toast-message" id="successMessage"></span>
+        </div>
+        <button class="toast-close" id="closeSuccess" aria-label="Close success message">&times;</button>
+    </div>
+
+    <!-- Error Toast -->
+    <div class="toast error-toast" id="errorToast" style="display: none;" role="alert" aria-live="assertive">
+        <div class="toast-content">
+            <span class="toast-icon">⚠️</span>
+            <span class="toast-message" id="errorMessage"></span>
+        </div>
+        <button class="toast-close" id="closeError" aria-label="Close error message">&times;</button>
+    </div>
+
+    <script src="contributions-script.js"></script>
+</body>
+</html>
