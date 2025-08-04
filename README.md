@@ -2,6 +2,8 @@
 ## Visit Here: [RagZzy](https://ragzzy.vercel.app/)
 A RAG-powered customer support chatbot that learns from user interactions and contributions.
 
+<img width="1512" height="821" alt="Screenshot 2025-08-03 at 9 01 11 PM" src="https://github.com/user-attachments/assets/70b3930e-b0df-4273-8d84-7c2da2d9c517" />
+
 ## Features
 
 -  **AI-Powered Responses**: Uses Google Gemini for intelligent, context-aware responses
