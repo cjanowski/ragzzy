@@ -288,9 +288,10 @@ module.exports = async (req, res) => {
         });
 
         // After stream completes, compute confidence and push to context once.
-        const finalConfidence = calculateResponseConfidence(retrievalResults, queryAnalysis, streamedText);
+        const sanitizedStreamText = sanitizeResponseText(streamedText);
+        const finalConfidence = calculateResponseConfidence(retrievalResults, queryAnalysis, sanitizedStreamText);
         updateConversationContext(conversationContext, message, {
-            text: streamedText,
+            text: sanitizedStreamText,
             confidence: finalConfidence,
             sources: retrievalResults.chunks.map(chunk => chunk.metadata?.source || 'knowledge_base').filter(Boolean)
         }, queryAnalysis);
@@ -782,46 +783,58 @@ function performKeywordSearch(query, topK) {
  * Stage 3: Context-aware search using conversation history
  */
 function performContextualSearch(queryEmbedding, conversationContext, topK) {
-    if (!conversationContext || !conversationContext.entities || conversationContext.entities.length === 0) {
+    if (!conversationContext || !conversationContext.entities) {
         return [];
     }
-    
-    const contextEntities = conversationContext.entities;
+    // entities is stored as a Map of type -> Set(values). Fallback to array shape if ever different.
+    const entitiesIterable = conversationContext.entities instanceof Map
+        ? Array.from(conversationContext.entities.entries()).flatMap(([type, set]) =>
+            Array.from(set || []).map(value => ({ type, value })))
+        : Array.isArray(conversationContext.entities)
+            ? conversationContext.entities
+            : [];
+
+    if (entitiesIterable.length === 0) {
+        return [];
+    }
+
     const results = knowledgeBase.chunks.map(chunk => {
         let contextScore = 0;
         let entityMatches = 0;
-        
-        contextEntities.forEach(entity => {
-            const entityRegex = new RegExp(entity.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+
+        entitiesIterable.forEach(entity => {
+            const safe = (entity.value || '').toString().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            if (!safe) return;
+            const entityRegex = new RegExp(safe, 'gi');
             const matches = (chunk.text.match(entityRegex) || []).length;
-            
+
             if (matches > 0) {
                 entityMatches++;
                 // Weight by entity type importance
-                const typeWeight = getEntityTypeWeight(entity.type);
+                const typeWeight = getEntityTypeWeight(entity.type?.toUpperCase?.() || entity.type || 'OTHER');
                 contextScore += matches * typeWeight;
             }
         });
-        
+
         // Boost for chunks that match multiple entities
         if (entityMatches > 1) {
             contextScore *= (1 + entityMatches * 0.3);
         }
-        
-        const normalizedScore = Math.min(contextScore / contextEntities.length, 1.0);
-        
+
+        const normalizedScore = Math.min(contextScore / Math.max(1, entitiesIterable.length), 1.0);
+
         return {
             chunk,
             similarity: normalizedScore,
-            metadata: { 
-                ...chunk.metadata, 
+            metadata: {
+                ...chunk.metadata,
                 searchType: 'contextual',
                 entityMatches,
                 contextScore
             }
         };
     });
-    
+
     return results
         .sort((a, b) => b.similarity - a.similarity)
         .slice(0, topK)
@@ -1490,16 +1503,22 @@ async function generateContextAwareResponse(queryAnalysis, retrievalResults, con
         
         const responseText = result.response.text();
 
+        // Pre-sanitize before validation to reduce meta leakage
+        const preSanitized = sanitizeResponseText(responseText);
+
         // Post-generation validator with single revision pass
-        const validated = await runValidatorAndMaybeRevise(responseText, {
+        const validated = await runValidatorAndMaybeRevise(preSanitized, {
             personaEnabled: (conversationContext?._requestPersona === 'senior_support') || CONFIG.supportPersonaEnabled
         });
 
         // Calculate confidence based on multiple factors
         const confidence = calculateResponseConfidence(retrievalResults, queryAnalysis, validated.text);
 
+        // Final sanitize in case revision reintroduced any headings
+        const finalText = sanitizeResponseText(validated.text);
+
         return {
-            text: validated.text,
+            text: finalText,
             confidence,
             sources: retrievalResults.chunks.map(chunk => chunk.metadata?.source || 'knowledge_base').filter(Boolean),
             validation: validated.meta
@@ -1541,8 +1560,15 @@ async function buildDynamicPrompt(queryAnalysis, context, conversationHistory, r
         }
     }
 
-    // Base assistant identity
-    sections.push('You are RagZzy, a helpful customer support assistant.');
+    // Base assistant identity with clear style guidance to avoid checklist/plan/summary boilerplate
+    sections.push([
+        'You are RagZzy, a helpful customer support assistant.',
+        'Respond conversationally and directly to the user’s question.',
+        'Do not include meta sections like "Summary:", "Steps:", "Validation:", "Rollback:", or "Notes:".',
+        'Do not list generic capabilities or describe internal processes unless explicitly asked.',
+        'Avoid bullet-point checklists unless the user asks for steps or a list.',
+        'Prefer a concise, helpful paragraph or two that answers the question.'
+    ].join(' '));
 
     // Conversation history
     if (conversationHistory) {
@@ -1563,11 +1589,11 @@ async function buildDynamicPrompt(queryAnalysis, context, conversationHistory, r
     }
     sections.push(parts.join('\n'));
 
-    // Response type instructions
+    // Response type instructions with anti-boilerplate constraint
     const responseInstructions = {
-        'comprehensive': 'Provide a detailed, thorough response that fully addresses the question. Include relevant details and context.',
-        'concise': 'Provide a brief, direct answer that gets straight to the point while being helpful.',
-        'explanatory': 'Provide a clear explanation with step-by-step details or background information to help the user understand.'
+        'comprehensive': 'Provide a detailed, thorough response that fully addresses the question with relevant details and context. Do not include boilerplate sections or headings.',
+        'concise': 'Provide a brief, direct answer that gets straight to the point while being helpful. No boilerplate headings.',
+        'explanatory': 'Provide a clear explanation with step-by-step details only if steps are explicitly helpful. Avoid meta headings.'
     };
     sections.push(responseInstructions[responseType] || responseInstructions['comprehensive']);
 
@@ -1699,6 +1725,27 @@ function calculateResponseConfidence(retrievalResults, queryAnalysis, responseTe
     }
     
     return Math.min(Math.max(confidence, 0), 1); // Clamp between 0 and 1
+}
+
+/**
+ * Strip residual boilerplate/meta headings the model may emit.
+ * Keeps natural language intact; removes leading heading tokens and common section labels.
+ */
+function sanitizeResponseText(text) {
+    if (!text || typeof text !== 'string') return text;
+    let t = text;
+
+    // Remove typical section headings at line starts (case-insensitive)
+    const headingRx = /^(summary|steps|validation|rollback|notes|plan|task[s]?|checklist)\s*:?\s*/gim;
+    t = t.replace(headingRx, '');
+
+    // Remove repeated heading lines
+    t = t.split('\n').map(line => line.replace(/^(summary|steps|validation|rollback|notes)\s*:?\s*/i, '')).join('\n');
+
+    // Trim excessive surrounding quotes or code fences the model might introduce
+    t = t.replace(/^```[\s\S]*?\n/, '').replace(/```$/,'').trim();
+
+    return t.trim();
 }
 
 /**
@@ -2277,22 +2324,24 @@ async function runValidatorAndMaybeRevise(text, { personaEnabled }) {
             return { text, meta: { validated: true, revised: false, verdict } };
         }
 
-        // One revision pass
+        // One revision pass with anti-boilerplate guardrails
         const revisePrompt = [
             personaEnabled ? buildSeniorSupportPersonaBlock() : 'You are a helpful assistant.',
             '',
             'Revise the response to satisfy ALL checklist items below while preserving correct content.',
+            'IMPORTANT: Do NOT include headings like "Summary:", "Steps:", "Validation:", "Rollback:", or "Notes:".',
+            'Write a natural, conversational answer without meta sections.',
             checklist,
             '',
             'Original response:',
             text,
             '',
-            'Revised response:'
+            'Revised response (no headings, no boilerplate, answer directly):'
         ].join('\n');
 
         const revRes = await chatModel.generateContent({
             contents: [{ role: 'user', parts: [{ text: revisePrompt }] }],
-            generationConfig: { maxOutputTokens: Math.min(CONFIG.maxResponseTokens, 900), temperature: 0.3, topP: 0.8, topK: 40 }
+            generationConfig: { maxOutputTokens: Math.min(CONFIG.maxResponseTokens, 700), temperature: 0.3, topP: 0.8, topK: 40 }
         });
         const revisedText = revRes.response.text() || text;
 
