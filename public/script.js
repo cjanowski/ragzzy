@@ -314,8 +314,7 @@ class RagzzyChatApp {
     formatMessage(text) {
         // Basic formatting - convert line breaks and handle basic markdown
         return text
-            .replace(/
-/g, '<br>')
+            .replace(/\n/g, '<br>')
             .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
             .replace(/\*(.*?)\*/g, '<em>$1</em>')
             .replace(/`(.*?)`/g, '<code>$1</code>');
