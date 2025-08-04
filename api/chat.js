@@ -6,17 +6,27 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const fs = require('fs');
 const path = require('path');
+const MiniSearch = require('minisearch');
 const {
     truthyEnv,
     buildSeniorSupportPersonaBlock,
     getFewShotExamples,
-    renderFewShotExamples
+    renderFewShotExamples,
+    getSupportValidatorChecklist
 } = require('./persona');
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const chatModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
 const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+
+// Load support seeds for dynamic few-shot selection
+let supportSeeds = [];
+try {
+    supportSeeds = require(path.join(process.cwd(), 'scripts', 'seedSupportPersona.js'));
+} catch (e) {
+    console.warn('Could not load scripts/seedSupportPersona.js for few-shot selection:', e?.message);
+}
 
 // Streaming support: helper to convert model stream chunks to text parts
 async function streamModelToResponse(model, prompt, res, requestId, generationConfig = {}) {
@@ -72,6 +82,10 @@ async function streamModelToResponse(model, prompt, res, requestId, generationCo
 let knowledgeBase = null;
 let lastProcessed = 0;
 
+// MiniSearch index (BM25-ish keyword retrieval)
+let miniSearch = null;
+let miniSearchReady = false;
+
 // In-memory conversation memory and user personalization
 const conversationMemory = new Map(); // sessionId -> conversation data
 const userProfiles = new Map(); // userId -> user preferences and learning data
@@ -97,7 +111,30 @@ const CONFIG = {
     adaptiveChunkRetrieval: true,
     maxQueryExpansions: 2,
     // Feature flags
-    supportPersonaEnabled: truthyEnv(process.env.SUPPORT_PERSONA)
+    supportPersonaEnabled: truthyEnv(process.env.SUPPORT_PERSONA),
+    // Hybrid retrieval weights and flags
+    hybrid: {
+        enableMiniSearch: true,
+        semanticWeight: 0.6,
+        keywordWeight: 0.35,
+        contextualWeight: 0.1,
+        multiTypeBoost: 1.2,
+        freshnessNovalue: 1.0 // fallback boost if not present
+    },
+    // Dynamic few-shot using seeds
+    fewshot: {
+        enable: true,
+        k: parseInt(process.env.FS_K || '3', 10),
+        maxTokens: 600, // budget for examples block
+        minSimilarity: 0.2
+    },
+    // Sentence-level packing configuration
+    packing: {
+        enableSentencePacking: true,
+        maxContextTokens: 1500, // budget for retrieved context before prompt
+        sentenceSplitRegex: /(?<=\\.|\\?|!)\\s+(?=[A-Z0-9])/,
+        tokensPerChar: 0.25 // rough heuristic for Gemini tokens
+    }
 };
 
 /**
@@ -215,7 +252,7 @@ module.exports = async (req, res) => {
             .slice(-6)
             .map(msg => `${msg.type === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
             .join('\n');
-        const prompt = buildDynamicPrompt(queryAnalysis, contextBlock, history, 'comprehensive', conversationContext);
+        const prompt = await buildDynamicPrompt(queryAnalysis, contextBlock, history, 'comprehensive', conversationContext);
 
         const streamedText = await streamModelToResponse(chatModel, prompt, res, requestId, {
             maxOutputTokens: getMaxTokensForResponseType('comprehensive'),
@@ -466,6 +503,8 @@ async function ensureKnowledgeBase() {
                     version: '1.0'
                 }
             };
+            // initialize empty MiniSearch index
+            await buildMiniSearchIndex([]);
             return;
         }
         
@@ -479,8 +518,11 @@ async function ensureKnowledgeBase() {
             const knowledgeText = fs.readFileSync(knowledgeBasePath, 'utf-8');
             knowledgeBase = await processKnowledgeBase(knowledgeText);
             lastProcessed = Date.now();
-            
-            console.log(`Knowledge base loaded: ${knowledgeBase.chunks.length} chunks`);
+
+            // Build/update MiniSearch index from chunks
+            await buildMiniSearchIndex(knowledgeBase.chunks);
+
+            console.log(`Knowledge base loaded: ${knowledgeBase.chunks.length} chunks; miniSearchReady=${miniSearchReady}`);
         }
         
     } catch (error) {
@@ -495,6 +537,7 @@ async function ensureKnowledgeBase() {
                 version: '1.0'
             }
         };
+        await buildMiniSearchIndex([]);
     }
 }
 
@@ -608,7 +651,7 @@ function searchSimilarChunks(queryEmbedding, topK = 5, query = '', conversationC
     // Stage 1: Semantic similarity search
     const semanticResults = performSemanticSearch(queryEmbedding, topK * 3);
     
-    // Stage 2: Keyword-based search for exact matches
+    // Stage 2: Keyword-based search (MiniSearch BM25) for exact/rare terms
     const keywordResults = performKeywordSearch(query, topK * 2);
     
     // Stage 3: Context-aware search using conversation history
@@ -657,60 +700,56 @@ function performKeywordSearch(query, topK) {
     if (!query || typeof query !== 'string') {
         return [];
     }
-    
-    const queryWords = query.toLowerCase()
-        .replace(/[^\w\s]/g, ' ')
-        .split(/\s+/)
-        .filter(word => word.length > 2);
-    
-    if (queryWords.length === 0) {
+    if (!CONFIG.hybrid.enableMiniSearch || !miniSearchReady || !miniSearch) {
+        // fallback to naive keyword scoring if MiniSearch is not ready
+        const queryWords = query.toLowerCase()
+            .replace(/[^\w\s]/g, ' ')
+            .split(/\s+/)
+            .filter(word => word.length > 2);
+        if (queryWords.length === 0) return [];
+        const results = knowledgeBase.chunks.map(chunk => {
+            const chunkText = chunk.text.toLowerCase();
+            let score = 0, exactMatches = 0, partialMatches = 0;
+            queryWords.forEach(word => {
+                const exactCount = (chunkText.match(new RegExp(`\\b${word}\\b`, 'g')) || []).length;
+                if (exactCount > 0) { exactMatches++; score += exactCount * 2; }
+                if (chunkText.includes(word)) { partialMatches++; score += 0.5; }
+            });
+            const normalizedScore = score / (queryWords.length * 2);
+            return {
+                chunk,
+                similarity: normalizedScore,
+                metadata: { ...chunk.metadata, searchType: 'keyword', exactMatches, partialMatches }
+            };
+        });
+        return results
+            .sort((a, b) => b.similarity - a.similarity)
+            .slice(0, topK)
+            .filter(result => result.similarity > 0.1);
+    }
+
+    // MiniSearch path
+    try {
+        const msResults = miniSearch.search(query, {
+            prefix: true, // allow partials for rare terms
+            fuzzy: 0,     // keep strict unless you want limited fuzziness
+            boost: { text: 1 }
+        });
+        // Normalize MiniSearch score to 0..1 by dividing by max score observed
+        const maxScore = msResults.length > 0 ? msResults[0].score : 1;
+        const mapped = msResults.slice(0, topK).map(r => {
+            const chunk = knowledgeBase.chunks.find(c => c.id === r.id) || { text: r.text || '', metadata: {} };
+            return {
+                chunk,
+                similarity: maxScore ? (r.score / maxScore) : 0,
+                metadata: { ...chunk.metadata, searchType: 'keyword', minisearchScore: r.score }
+            };
+        });
+        return mapped;
+    } catch (e) {
+        console.warn('MiniSearch search failed, falling back:', e?.message);
         return [];
     }
-    
-    const results = knowledgeBase.chunks.map(chunk => {
-        const chunkText = chunk.text.toLowerCase();
-        let score = 0;
-        let exactMatches = 0;
-        let partialMatches = 0;
-        
-        queryWords.forEach(word => {
-            // Exact word match (higher weight)
-            const exactCount = (chunkText.match(new RegExp(`\\b${word}\\b`, 'g')) || []).length;
-            if (exactCount > 0) {
-                exactMatches++;
-                score += exactCount * 2;
-            }
-            
-            // Partial match (lower weight)
-            if (chunkText.includes(word)) {
-                partialMatches++;
-                score += 0.5;
-            }
-        });
-        
-        // Boost score for multiple word matches
-        if (exactMatches > 1) {
-            score *= (1 + exactMatches * 0.2);
-        }
-        
-        const normalizedScore = score / (queryWords.length * 2);
-        
-        return {
-            chunk,
-            similarity: normalizedScore,
-            metadata: { 
-                ...chunk.metadata, 
-                searchType: 'keyword',
-                exactMatches,
-                partialMatches
-            }
-        };
-    });
-    
-    return results
-        .sort((a, b) => b.similarity - a.similarity)
-        .slice(0, topK)
-        .filter(result => result.similarity > 0.1);
 }
 
 /**
@@ -770,11 +809,13 @@ function combineAndRerankResults(results, query, conversationContext, topK) {
     const { semantic, keyword, contextual } = results;
     const combinedMap = new Map();
     
+    const weights = CONFIG.hybrid || { semanticWeight: 0.6, keywordWeight: 0.35, contextualWeight: 0.1, multiTypeBoost: 1.2 };
+
     // Combine results with weighted scoring
     const processResults = (resultList, weight, boost = 1) => {
-        resultList.forEach(result => {
+        (resultList || []).forEach(result => {
             const chunkId = result.chunk.id;
-            const weightedScore = result.similarity * weight * boost;
+            const weightedScore = (result.similarity || 0) * weight * boost;
             
             if (combinedMap.has(chunkId)) {
                 const existing = combinedMap.get(chunkId);
@@ -792,16 +833,16 @@ function combineAndRerankResults(results, query, conversationContext, topK) {
         });
     };
     
-    // Weight different search types
-    processResults(semantic, 0.6); // Semantic search base weight
-    processResults(keyword, 0.3, 1.5); // Keyword search with boost for exact matches
-    processResults(contextual, 0.1, 2.0); // Contextual search with high boost
+    // Weight different search types (configurable)
+    processResults(semantic, weights.semanticWeight);
+    processResults(keyword, weights.keywordWeight, 1.5);
+    processResults(contextual, weights.contextualWeight, 2.0);
     
     // Convert map to array and apply final reranking
     const finalResults = Array.from(combinedMap.values())
         .map(result => {
             // Boost for multiple search type matches
-            const searchTypeBoost = result.searchTypes.length > 1 ? 1.2 : 1.0;
+            const searchTypeBoost = result.searchTypes.length > 1 ? weights.multiTypeBoost : 1.0;
             
             // Boost for recent chunks (if timestamp available)
             const freshnessBoost = calculateFreshnessBoost(result.chunk.metadata);
@@ -1146,13 +1187,12 @@ async function expandQuery(originalQuery, analysis, conversationContext) {
  */
 async function performContextAwareRetrieval(queryAnalysis, conversationContext, requestId) {
     try {
-        const allChunks = [];
         const chunkScores = new Map();
         
         // Process each expanded query
         for (const query of queryAnalysis.expandedQueries) {
             const queryEmbedding = await generateEmbedding(query);
-            const chunks = searchSimilarChunks(queryEmbedding, CONFIG.maxRetrievalChunks * 2, query, conversationContext);
+            const chunks = searchSimilarChunks(queryEmbedding, CONFIG.maxRetrievalChunks * 3, query, conversationContext);
             
             chunks.forEach(chunk => {
                 const chunkId = chunk.chunk.id;
@@ -1187,24 +1227,31 @@ async function performContextAwareRetrieval(queryAnalysis, conversationContext, 
             });
         }
         
-        // Sort and return top chunks
-        const sortedChunks = Array.from(chunkScores.values())
+        // Sort and take more to allow sentence packing selection
+        const topChunks = Array.from(chunkScores.values())
             .sort((a, b) => b.score - a.score)
-            .slice(0, CONFIG.maxRetrievalChunks);
+            .slice(0, CONFIG.maxRetrievalChunks * 2);
+
+        // Sentence-level packing
+        let packed = topChunks;
+        if (CONFIG.packing.enableSentencePacking) {
+            packed = packSentencesFromChunks(topChunks, CONFIG.packing.maxContextTokens);
+        }
         
         const result = {
-            chunks: sortedChunks,
-            bestSimilarity: sortedChunks.length > 0 ? sortedChunks[0].baseScore : 0,
-            contextBoost: sortedChunks.length > 0 ? sortedChunks[0].contextBoost : 0,
-            averageScore: sortedChunks.length > 0 ? 
-                sortedChunks.reduce((sum, chunk) => sum + chunk.score, 0) / sortedChunks.length : 0
+            chunks: packed,
+            bestSimilarity: packed.length > 0 ? packed[0].baseScore : 0,
+            contextBoost: packed.length > 0 ? packed[0].contextBoost : 0,
+            averageScore: packed.length > 0 ?
+                packed.reduce((sum, c) => sum + (c.score || 0), 0) / packed.length : 0
         };
         
         console.log(`[${requestId}] Context-aware retrieval completed:`, {
             totalChunksEvaluated: chunkScores.size,
-            finalChunksSelected: sortedChunks.length,
+            finalChunksSelected: packed.length,
             bestScore: result.bestSimilarity,
-            averageScore: result.averageScore
+            averageScore: result.averageScore,
+            sentencePacked: CONFIG.packing.enableSentencePacking
         });
         
         return result;
@@ -1214,12 +1261,21 @@ async function performContextAwareRetrieval(queryAnalysis, conversationContext, 
         // Fallback to basic retrieval
         const queryEmbedding = await generateEmbedding(queryAnalysis.originalQuery);
         const chunks = searchSimilarChunks(queryEmbedding, CONFIG.maxRetrievalChunks, queryAnalysis.originalQuery, conversationContext);
-        return {
-            chunks: chunks.map(chunk => ({ ...chunk, score: chunk.similarity })),
-            bestSimilarity: chunks.length > 0 ? chunks[0].similarity : 0,
+        const packed = CONFIG.packing.enableSentencePacking ? packSentencesFromChunks(chunks.map(c => ({
+            chunk: c.chunk,
+            score: c.similarity,
+            baseScore: c.similarity,
             contextBoost: 0,
-            averageScore: chunks.length > 0 ? 
-                chunks.reduce((sum, chunk) => sum + chunk.similarity, 0) / chunks.length : 0
+            intentBoost: 0,
+            entityBoost: 0,
+            metadata: c.metadata
+        })), CONFIG.packing.maxContextTokens) : chunks;
+        return {
+            chunks: packed,
+            bestSimilarity: packed.length > 0 ? (packed[0].baseScore || 0) : 0,
+            contextBoost: 0,
+            averageScore: packed.length > 0 ?
+                packed.reduce((sum, c) => sum + (c.score || 0), 0) / packed.length : 0
         };
     }
 }
@@ -1385,11 +1441,11 @@ async function generateContextAwareResponse(queryAnalysis, retrievalResults, con
             .join('\n');
         
         // Dynamic prompt based on response type and context
-        let prompt = buildDynamicPrompt(
-            queryAnalysis, 
-            context, 
-            conversationHistory, 
-            responseType, 
+        const prompt = await buildDynamicPrompt(
+            queryAnalysis,
+            context,
+            conversationHistory,
+            responseType,
             conversationContext
         );
         
@@ -1407,14 +1463,20 @@ async function generateContextAwareResponse(queryAnalysis, retrievalResults, con
         performanceMonitor.recordGeneration(Date.now() - generationStartTime);
         
         const responseText = result.response.text();
-        
+
+        // Post-generation validator with single revision pass
+        const validated = await runValidatorAndMaybeRevise(responseText, {
+            personaEnabled: (conversationContext?._requestPersona === 'senior_support') || CONFIG.supportPersonaEnabled
+        });
+
         // Calculate confidence based on multiple factors
-        const confidence = calculateResponseConfidence(retrievalResults, queryAnalysis, responseText);
-        
+        const confidence = calculateResponseConfidence(retrievalResults, queryAnalysis, validated.text);
+
         return {
-            text: responseText,
+            text: validated.text,
             confidence,
-            sources: retrievalResults.chunks.map(chunk => chunk.metadata?.source || 'knowledge_base').filter(Boolean)
+            sources: retrievalResults.chunks.map(chunk => chunk.metadata?.source || 'knowledge_base').filter(Boolean),
+            validation: validated.meta
         };
         
     } catch (error) {
@@ -1426,7 +1488,7 @@ async function generateContextAwareResponse(queryAnalysis, retrievalResults, con
 /**
  * Build dynamic prompt based on context and response type
  */
-function buildDynamicPrompt(queryAnalysis, context, conversationHistory, responseType, conversationContext) {
+async function buildDynamicPrompt(queryAnalysis, context, conversationHistory, responseType, conversationContext) {
     // Determine persona enablement:
     // 1) Per-request override via req.body.persona === 'senior_support'
     // 2) Fallback to env flag SUPPORT_PERSONA
@@ -1437,6 +1499,20 @@ function buildDynamicPrompt(queryAnalysis, context, conversationHistory, respons
     // Optional persona block
     if (enableSupportPersona) {
         sections.push(buildSeniorSupportPersonaBlock());
+    }
+
+    // Dynamic few-shot selection from seeds (if persona on)
+    if (enableSupportPersona && CONFIG.fewshot.enable && supportSeeds && supportSeeds.length > 0) {
+        try {
+            const k = Math.max(1, CONFIG.fewshot.k || 3);
+            const selected = await selectFewShotSeeds(queryAnalysis.originalQuery, supportSeeds, k, CONFIG.fewshot.minSimilarity);
+            const fewShotStr = renderFewShotExamples(selected.map(s => ({ user: s.user, assistant: s.assistant })));
+            if (fewShotStr) {
+                sections.push(fewShotStr);
+            }
+        } catch (e) {
+            console.warn('Few-shot selection failed:', e?.message);
+        }
     }
 
     // Base assistant identity
@@ -1495,13 +1571,8 @@ function buildDynamicPrompt(queryAnalysis, context, conversationHistory, respons
         sections.push('Maintain the same helpful, effective tone that worked well previously.');
     }
 
-    // Few-shot examples for persona steering
-    if (enableSupportPersona) {
-        const fewShot = renderFewShotExamples(getFewShotExamples());
-        if (fewShot) {
-            sections.push(fewShot);
-        }
-    }
+    // Few-shot examples are injected dynamically above when persona is enabled.
+    // Static block removed to avoid duplication and token bloat.
 
     // Final cue
     sections.push('Response:');
@@ -2108,6 +2179,105 @@ async function generateEmbeddingWithCache(text) {
 }
 
 /**
+ * Lightweight seed embedding cache and few-shot selector
+ */
+const seedEmbeddingCache = new Map();
+
+async function getSeedEmbedding(seed) {
+    const key = seed.id || seed.user.slice(0, 64);
+    if (seedEmbeddingCache.has(key)) return seedEmbeddingCache.get(key);
+    // Embed on a concatenation of user + assistant to capture topic
+    const text = `${seed.user}\n${seed.assistant}`.slice(0, 2000);
+    const emb = await generateEmbeddingWithCache(text);
+    seedEmbeddingCache.set(key, emb);
+    return emb;
+}
+
+async function selectFewShotSeeds(query, seeds, k = 3, minSim = 0.2) {
+    const qEmb = await generateEmbeddingWithCache(query);
+    const scored = [];
+    for (const s of seeds) {
+        try {
+            const e = await getSeedEmbedding(s);
+            const sim = cosineSimilarity(qEmb, e);
+            scored.push({ seed: s, sim });
+        } catch (_e) {}
+    }
+    scored.sort((a, b) => b.sim - a.sim);
+    const picked = scored.filter(x => x.sim >= minSim).slice(0, k).map(x => x.seed);
+    // Fallback to top-k even if below minSim to avoid empty block
+    return picked.length > 0 ? picked : scored.slice(0, k).map(x => x.seed);
+}
+
+/**
+ * Simple checklist-based validator with optional single revision.
+ */
+async function runValidatorAndMaybeRevise(text, { personaEnabled }) {
+    const checklist = personaEnabled ? getSupportValidatorChecklist() : [
+        'Checklist:',
+        '- Answer is helpful and accurate.',
+        '- No unsafe content.',
+        '- Responds directly to the question.'
+    ].join('\n');
+
+    // Ask model to evaluate against checklist and return a JSON verdict
+    const judgePrompt = [
+        'You are a strict validator. Given the Assistant response below, check the checklist and return a strict JSON object:',
+        '{ "ok": boolean, "missing": string[], "notes": string }',
+        '',
+        checklist,
+        '',
+        'Assistant response:',
+        text
+    ].join('\n');
+
+    try {
+        const evalRes = await chatModel.generateContent({
+            contents: [{ role: 'user', parts: [{ text: judgePrompt }] }],
+            generationConfig: { maxOutputTokens: 300, temperature: 0.1, topP: 0.8, topK: 40 }
+        });
+        const evalText = evalRes.response.text() || '';
+        let verdict = { ok: true, missing: [], notes: '' };
+        try {
+            // Extract JSON substring if model wrapped text
+            const jsonMatch = evalText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) verdict = JSON.parse(jsonMatch[0]);
+        } catch (_e) {
+            // If parse fails, consider ok to avoid degradation
+            verdict = { ok: true, missing: [], notes: 'parse_failed' };
+        }
+
+        if (verdict.ok) {
+            return { text, meta: { validated: true, revised: false, verdict } };
+        }
+
+        // One revision pass
+        const revisePrompt = [
+            personaEnabled ? buildSeniorSupportPersonaBlock() : 'You are a helpful assistant.',
+            '',
+            'Revise the response to satisfy ALL checklist items below while preserving correct content.',
+            checklist,
+            '',
+            'Original response:',
+            text,
+            '',
+            'Revised response:'
+        ].join('\n');
+
+        const revRes = await chatModel.generateContent({
+            contents: [{ role: 'user', parts: [{ text: revisePrompt }] }],
+            generationConfig: { maxOutputTokens: Math.min(CONFIG.maxResponseTokens, 900), temperature: 0.3, topP: 0.8, topK: 40 }
+        });
+        const revisedText = revRes.response.text() || text;
+
+        return { text: revisedText, meta: { validated: true, revised: true, verdict } };
+    } catch (e) {
+        console.warn('Validator failed:', e?.message);
+        return { text, meta: { validated: false, revised: false, error: 'validator_failed' } };
+    }
+}
+
+/**
  * Create a cache key for text
  */
 function createCacheKey(text) {
@@ -2155,6 +2325,174 @@ function optimizeMemoryUsage() {
 
 // Run memory optimization every 10 minutes
 setInterval(optimizeMemoryUsage, 10 * 60 * 1000);
+
+/**
+ * Build MiniSearch index from chunks (BM25-ish keyword retrieval)
+ */
+async function buildMiniSearchIndex(chunks) {
+    try {
+        if (!CONFIG.hybrid.enableMiniSearch) {
+            miniSearch = null;
+            miniSearchReady = false;
+            return;
+        }
+
+        miniSearch = new MiniSearch({
+            fields: ['text'],
+            storeFields: ['id', 'text'],
+            idField: 'id',
+            tokenize: (text, _fieldName) => {
+                // simple whitespace tokenizer, lowercase, strip punctuation
+                return (text || '')
+                    .toLowerCase()
+                    .replace(/[^\w\s]/g, ' ')
+                    .split(/\s+/)
+                    .filter(t => t && t.length > 1);
+            }
+        });
+
+        const docs = (chunks || []).map(c => ({ id: c.id, text: c.text }));
+        await miniSearch.addAllAsync(docs);
+        miniSearchReady = true;
+    } catch (e) {
+        console.warn('Failed to build MiniSearch index:', e?.message);
+        miniSearch = null;
+        miniSearchReady = false;
+    }
+}
+
+/**
+ * Estimate tokens from text length using heuristic
+ */
+function estimateTokens(text) {
+    const perChar = CONFIG.packing.tokensPerChar || 0.25;
+    return Math.ceil((text?.length || 0) * perChar);
+}
+
+/**
+ * Extract query terms for scoring sentences
+ */
+function getQueryTerms(query) {
+    if (!query) return [];
+    return query
+        .toLowerCase()
+        .replace(/[^\w\s]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 2);
+}
+
+/**
+ * Sentence-level packing under a token budget.
+ * Accepts array of { chunk, score, baseScore, ... } and returns similar array with chunk.text reduced.
+ */
+function packSentencesFromChunks(chunkEntries, maxTokensBudget) {
+    if (!Array.isArray(chunkEntries) || chunkEntries.length === 0) return [];
+
+    const sentenceSplit = CONFIG.packing.sentenceSplitRegex || /(?<=[.!?])\s+/;
+    const queryTermsSet = new Set(); // optionally filled per-chunk when available
+
+    // Build a flat list of sentence candidates with scoring
+    const candidates = [];
+    for (const entry of chunkEntries) {
+        const text = entry.chunk?.text || '';
+        const sentences = text.split(sentenceSplit).map(s => s.trim()).filter(Boolean);
+        for (const sentence of sentences) {
+            // base from chunk score, plus slight bonus if sentence is longer than a short threshold
+            let sScore = (entry.baseScore ?? entry.score ?? 0) + Math.min(sentence.length / 400, 0.05);
+
+            // query term overlap bonus (if we have original query in metadata; not always)
+            const terms = entry.metadata?.originalQueryTerms || [];
+            if (terms.length > 0) {
+                const lower = sentence.toLowerCase();
+                let hits = 0;
+                for (const t of terms) {
+                    if (t.length > 2 && lower.includes(t)) hits++;
+                }
+                if (hits > 0) {
+                    sScore += Math.min(0.02 * hits, 0.08);
+                }
+            }
+
+            candidates.push({
+                chunkId: entry.chunk.id,
+                sentence,
+                approxTokens: estimateTokens(sentence),
+                score: sScore,
+                originalEntry: entry
+            });
+        }
+    }
+
+    // Greedy packing by descending score density (score per token)
+    candidates.sort((a, b) => (b.score / Math.max(1, b.approxTokens)) - (a.score / Math.max(1, a.approxTokens)));
+
+    let remaining = Math.max(1, maxTokensBudget || 1000);
+    const selectedByChunk = new Map();
+
+    for (const c of candidates) {
+        if (remaining <= 0) break;
+        if (c.approxTokens > remaining) continue;
+
+        const list = selectedByChunk.get(c.chunkId) || [];
+        list.push(c);
+        selectedByChunk.set(c.chunkId, list);
+        remaining -= c.approxTokens;
+    }
+
+    // Rebuild packed entries per chunk, preserving metadata
+    const packed = [];
+    for (const [chunkId, list] of selectedByChunk.entries()) {
+        // Keep original entry fields but replace text with joined sentences (original order approximation)
+        // Sort sentences by their order in original text when possible
+        const entry = list[0].originalEntry;
+        const originalText = entry.chunk.text;
+        const orderMap = new Map();
+        list.forEach(s => orderMap.set(s, originalText.indexOf(s.sentence)));
+        list.sort((a, b) => orderMap.get(a) - orderMap.get(b));
+
+        const newText = list.map(s => s.sentence).join(' ');
+        const approxCombinedTokens = list.reduce((sum, s) => sum + s.approxTokens, 0);
+
+        packed.push({
+            ...entry,
+            chunk: {
+                ...entry.chunk,
+                text: newText
+            },
+            // keep the same score fields; optionally adjust score slightly by density
+            score: entry.score,
+            baseScore: entry.baseScore,
+            metadata: entry.metadata,
+            _packedTokens: approxCombinedTokens
+        });
+    }
+
+    // If packing ended up empty (e.g., sentences too long), fallback to original entries trimmed to budget
+    if (packed.length === 0) {
+        let fallbackRemaining = Math.max(1, maxTokensBudget || 1000);
+        for (const entry of chunkEntries) {
+            const t = entry.chunk.text;
+            const approx = estimateTokens(t);
+            if (approx <= fallbackRemaining) {
+                packed.push(entry);
+                fallbackRemaining -= approx;
+            } else if (fallbackRemaining > 20) {
+                // take a prefix
+                const allowedChars = Math.floor(fallbackRemaining / (CONFIG.packing.tokensPerChar || 0.25));
+                packed.push({
+                    ...entry,
+                    chunk: { ...entry.chunk, text: t.slice(0, Math.max(20, allowedChars)) }
+                });
+                fallbackRemaining = 0;
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+
+    return packed;
+}
 
 // Add user contributions to knowledge base
 function addUserContribution(question, answer, metadata = {}) {

@@ -43,6 +43,7 @@ function seniorSupportPlaybooks() {
 }
 
 function getFewShotExamples() {
+  // Default static few-shots (fallback)
   const examples = [
     {
       user: 'Our webhook verification fails intermittently for order.created. What should I check?',
@@ -74,6 +75,22 @@ function getFewShotExamples() {
     }
   ];
   return examples;
+}
+
+/**
+ * Lightweight validator checklist for Senior Support persona.
+ * Returns a short instruction block used in post-generation validation.
+ */
+function getSupportValidatorChecklist() {
+  return [
+    'Checklist:',
+    '- Response includes ALL sections: Summary, Steps, Validation, Rollback, Notes.',
+    '- Steps are numbered and actionable.',
+    '- No fabrication; avoid unverifiable claims.',
+    '- Respect security/privacy; no secrets or PII.',
+    '- Tone: calm, empathetic, ownership-driven.',
+    'If any item is missing or violated, revise to add/fix while preserving correct content.'
+  ].join('\n');
 }
 
 /**

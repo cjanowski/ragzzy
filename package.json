@@ -9,7 +9,11 @@
     "deploy": "vercel --prod",
     "test": "echo \"No tests specified yet\" && exit 0",
     "lint": "echo \"No linting configured yet\"",
-    "start": "node -e \"console.log('Use: vercel dev')\""
+    "start": "node -e \"console.log('Use: vercel dev')\"",
+    "eval": "node scripts/eval.js",
+    "eval:persona": "SUPPORT_PERSONA=1 node scripts/eval.js --persona",
+    "eval:k5": "FS_K=5 node scripts/eval.js --k 5",
+    "eval:out": "node scripts/eval.js --out eval.jsonl"
   },
   "keywords": ["chatbot", "rag", "ai", "customer-support", "gemini", "knowledge-base"],
   "author": "",
@@ -17,6 +21,7 @@
   "type": "commonjs",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
-    "dotenv": "^17.2.1"
+    "dotenv": "^17.2.1",
+    "minisearch": "^7.1.0"
   }
 }
