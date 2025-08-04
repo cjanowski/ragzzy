@@ -27,9 +27,24 @@
                         <p class="header-subtitle">AI-powered help that gets smarter with your input</p>
                     </div>
                 </div>
-                <div class="status-indicator">
-                    <div class="status-dot online" id="statusDot"></div>
-                    <span class="status-text" id="statusText">Online</span>
+                <div class="header-actions">
+                    <div class="contribution-toggle">
+                        <label class="toggle-switch" for="contributionToggle" title="Enable/disable contribution prompts">
+                            <input type="checkbox" id="contributionToggle" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="toggle-label">Contributions</span>
+                    </div>
+                    <button class="settings-toggle" id="settingsToggle" aria-label="Settings" title="Settings">
+                        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M12 8.5C10.0656 8.5 8.5 10.0656 8.5 12C8.5 13.9344 10.0656 15.5 12 15.5C13.9344 15.5 15.5 13.9344 15.5 12C15.5 10.0656 13.9344 8.5 12 8.5Z" fill="currentColor"/>
+                            <path d="M21.4274 12.8537C21.1518 13.8945 20.6825 14.8732 20.0398 15.7499L20.9297 17.0711C21.3202 17.6814 21.2016 18.4883 20.6339 18.9592L19.0408 20.2C18.473 20.6709 17.6661 20.5523 17.1952 19.9846L16.3053 18.6634C15.4286 19.3061 14.4499 19.7754 13.4091 20.051L13.1335 21.5H11.8665L11.5909 20.051C10.5501 19.7754 9.57139 19.3061 8.69468 18.6634L7.80483 19.9846C7.33393 20.5523 6.52702 20.6709 5.95923 20.2L4.36609 18.9592C3.79831 18.4883 3.67976 17.6814 4.07026 17.0711L4.96021 15.7499C4.31749 14.8732 3.8482 13.8945 3.5726 12.8537L2 12.5781V11.4219L3.5726 11.1463C3.8482 10.1055 4.31749 9.12676 4.96021 8.25005L4.07026 6.92893C3.67976 6.31864 3.79831 5.51173 4.36609 5.04083L5.95923 3.80002C6.52702 3.32912 7.33393 3.44767 7.80483 4.01546L8.69468 5.33658C9.57139 4.69386 10.5501 4.22457 11.5909 3.94897L11.8665 2.5H13.1335L13.4091 3.94897C14.4499 4.22457 15.4286 4.69386 16.3053 5.33658L17.1952 4.01546C17.6661 3.44767 18.473 3.32912 19.0408 3.80002L20.6339 5.04083C21.2016 5.51173 21.3202 6.31864 20.9297 6.92893L20.0398 8.25005C20.6825 9.12676 21.1518 10.1055 21.4274 11.1463L23 11.4219V12.5781L21.4274 12.8537Z" fill="currentColor"/>
+                        </svg>
+                    </button>
+                    <div class="status-indicator">
+                        <div class="status-dot online" id="statusDot"></div>
+                        <span class="status-text" id="statusText">Online</span>
+                    </div>
                 </div>
             </div>
         </header>
@@ -118,6 +133,38 @@
                             <span class="btn-text">Add Knowledge</span>
                             <span class="btn-loading" style="display: none;">Adding...</span>
                         </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings Modal -->
+            <div class="modal-overlay" id="settingsModal" style="display: none;">
+                <div class="modal-content settings-modal" role="dialog" aria-labelledby="settingsTitle" aria-modal="true">
+                    <div class="modal-header">
+                        <h2 id="settingsTitle">Settings</h2>
+                        <button class="modal-close" id="closeSettings" aria-label="Close settings modal">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="settings-section">
+                            <h3>Contribution Preferences</h3>
+                            <div class="setting-group">
+                                <div class="setting-item">
+                                    <div class="setting-info">
+                                        <label for="contributionEnabled" class="setting-label">Enable Contribution Prompts</label>
+                                        <p class="setting-description" id="contributionEnabled-desc">When I don't know an answer, prompt you to help teach me by providing the information.</p>
+                                    </div>
+                                    <div class="setting-control">
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="contributionEnabled" checked aria-describedby="contributionEnabled-desc">
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-primary" id="saveSettings">Save Changes</button>
                     </div>
                 </div>
             </div>

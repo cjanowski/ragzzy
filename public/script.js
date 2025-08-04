@@ -9,6 +9,7 @@ class RagzzyChatApp {
         this.messages = [];
         this.isTyping = false;
         this.guidedPrompts = [];
+        this.contributionsEnabled = true;
         
         // DOM elements
         this.elements = {
@@ -38,13 +39,23 @@ class RagzzyChatApp {
             cancelContribution: document.getElementById('cancelContribution'),
             submitContribution: document.getElementById('submitContribution'),
             
+            // Settings elements
+            settingsToggle: document.getElementById('settingsToggle'),
+            settingsModal: document.getElementById('settingsModal'),
+            closeSettings: document.getElementById('closeSettings'),
+            contributionEnabled: document.getElementById('contributionEnabled'),
+            saveSettings: document.getElementById('saveSettings'),
+            
             // Toast messages
             errorToast: document.getElementById('errorToast'),
             successToast: document.getElementById('successToast'),
             errorMessage: document.getElementById('errorMessage'),
             successMessage: document.getElementById('successMessage'),
             closeError: document.getElementById('closeError'),
-            closeSuccess: document.getElementById('closeSuccess')
+            closeSuccess: document.getElementById('closeSuccess'),
+            
+            // Settings
+            contributionToggle: document.getElementById('contributionToggle')
         };
         
         this.init();
@@ -58,6 +69,7 @@ class RagzzyChatApp {
     
     init() {
         this.setupEventListeners();
+        this.loadSettings();
         this.updateWelcomeTime();
         this.loadGuidedPrompts();
         this.updateCharCounter();
@@ -149,12 +161,65 @@ class RagzzyChatApp {
             });
         }
         
-        // Escape key to close modal
+        // Escape key to close modals
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && this.elements.contributionModal && this.elements.contributionModal.style.display === 'flex') {
-                this.hideContributionModal();
+            if (e.key === 'Escape') {
+                if (this.elements.contributionModal && this.elements.contributionModal.style.display === 'flex') {
+                    this.hideContributionModal();
+                } else if (this.elements.settingsModal && this.elements.settingsModal.style.display === 'flex') {
+                    this.hideSettingsModal();
+                }
             }
         });
+        
+        // Contribution toggle
+        if (this.elements.contributionToggle) {
+            this.elements.contributionToggle.addEventListener('change', (e) => {
+                this.contributionsEnabled = e.target.checked;
+                this.saveContributionPreference();
+                
+                // Hide any existing contribution prompts when disabled
+                if (!this.contributionsEnabled) {
+                    this.hideAllContributionPrompts();
+                }
+                
+                this.showSuccess(this.contributionsEnabled ? 
+                    'Contribution prompts enabled' : 
+                    'Contribution prompts disabled'
+                );
+            });
+            
+            // Load saved preference
+            this.loadContributionPreference();
+        }
+
+        // Settings events
+        if (this.elements.settingsToggle) {
+            this.elements.settingsToggle.addEventListener('click', () => {
+                this.showSettingsModal();
+            });
+        }
+
+        if (this.elements.closeSettings) {
+            this.elements.closeSettings.addEventListener('click', () => {
+                this.hideSettingsModal();
+            });
+        }
+
+        if (this.elements.saveSettings) {
+            this.elements.saveSettings.addEventListener('click', () => {
+                this.saveSettings();
+            });
+        }
+
+        // Settings modal overlay click to close
+        if (this.elements.settingsModal) {
+            this.elements.settingsModal.addEventListener('click', (e) => {
+                if (e.target === this.elements.settingsModal) {
+                    this.hideSettingsModal();
+                }
+            });
+        }
     }
     
     updateWelcomeTime() {
@@ -257,8 +322,8 @@ class RagzzyChatApp {
             // Play notification sound for bot responses
             this.playNotificationSound();
             
-            // Handle contribution prompt if present
-            if (response.contributionPrompt && response.contributionPrompt.show) {
+            // Handle contribution prompt if present and enabled in settings
+            if (response.contributionPrompt && response.contributionPrompt.show && this.contributionsEnabled) {
                 this.showContributionPrompt(response.contributionPrompt.message, message);
             }
             
@@ -513,6 +578,74 @@ class RagzzyChatApp {
         this.elements.messagesContainer.appendChild(suggestionDiv);
         this.scrollToBottom();
     }
+
+    // Settings Methods
+    loadSettings() {
+        try {
+            const settings = JSON.parse(localStorage.getItem('ragzzy-settings') || '{}');
+            
+            // Set contribution enabled setting
+            const contributionEnabled = settings.contributionEnabled !== false; // Default to true
+            if (this.elements.contributionEnabled) {
+                this.elements.contributionEnabled.checked = contributionEnabled;
+            }
+            
+            // Store in instance for easy access
+            this.settings = {
+                contributionEnabled,
+                ...settings
+            };
+        } catch (error) {
+            console.error('Error loading settings:', error);
+            // Set defaults
+            this.settings = {
+                contributionEnabled: true
+            };
+        }
+    }
+
+    saveSettings() {
+        try {
+            const settings = {
+                contributionEnabled: this.elements.contributionEnabled?.checked !== false
+            };
+            
+            localStorage.setItem('ragzzy-settings', JSON.stringify(settings));
+            this.settings = settings;
+            
+            this.showSuccess('Settings saved successfully!');
+            this.hideSettingsModal();
+        } catch (error) {
+            console.error('Error saving settings:', error);
+            this.showError('Failed to save settings. Please try again.');
+        }
+    }
+
+    showSettingsModal() {
+        if (!this.elements.settingsModal) {
+            console.error('Settings modal not found');
+            return;
+        }
+
+        // Load current settings into form
+        if (this.elements.contributionEnabled && this.settings) {
+            this.elements.contributionEnabled.checked = this.settings.contributionEnabled !== false;
+        }
+
+        this.elements.settingsModal.style.display = 'flex';
+
+        // Focus first interactive element
+        const firstCheckbox = this.elements.settingsModal.querySelector('input[type="checkbox"]');
+        if (firstCheckbox) {
+            firstCheckbox.focus();
+        }
+    }
+
+    hideSettingsModal() {
+        if (this.elements.settingsModal) {
+            this.elements.settingsModal.style.display = 'none';
+        }
+    }
     
     loadGuidedPrompts() {
         // Default guided prompts - in a real app, these might come from the API
@@ -556,6 +689,10 @@ class RagzzyChatApp {
     }
     
     showKnowledgePrompt() {
+        if (!this.contributionsEnabled) {
+            return;
+        }
+        
         const guidedPromptsHtml = this.guidedPrompts.map(prompt => 
             `<div class="guided-prompt-item ${prompt.required ? 'required' : ''}" onclick="ragzzyApp.showContributionModal(\`${prompt.question.replace(/'/g, "\\'")}\`)">                ${prompt.question}            </div>`
         ).join('');
@@ -870,6 +1007,45 @@ class RagzzyChatApp {
         } catch (e) {
             // Silently fail if audio doesn't work
         }
+    }
+    
+    // Contribution Settings Management
+    saveContributionPreference() {
+        try {
+            localStorage.setItem('ragzzy-contributions-enabled', JSON.stringify(this.contributionsEnabled));
+        } catch (e) {
+            console.warn('Could not save contribution preference');
+        }
+    }
+    
+    loadContributionPreference() {
+        try {
+            const saved = localStorage.getItem('ragzzy-contributions-enabled');
+            if (saved !== null) {
+                this.contributionsEnabled = JSON.parse(saved);
+                if (this.elements.contributionToggle) {
+                    this.elements.contributionToggle.checked = this.contributionsEnabled;
+                }
+            }
+        } catch (e) {
+            console.warn('Could not load contribution preference');
+        }
+    }
+    
+    hideAllContributionPrompts() {
+        // Hide knowledge prompt
+        if (this.elements.knowledgePrompt) {
+            this.elements.knowledgePrompt.style.display = 'none';
+        }
+        
+        // Remove contribution prompts from messages
+        const contributionPrompts = document.querySelectorAll('.contribution-prompt');
+        contributionPrompts.forEach(prompt => {
+            prompt.remove();
+        });
+        
+        // Hide contribution modal if open
+        this.hideContributionModal();
     }
 }
 
