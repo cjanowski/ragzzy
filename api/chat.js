@@ -6,11 +6,67 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const fs = require('fs');
 const path = require('path');
+const {
+    truthyEnv,
+    buildSeniorSupportPersonaBlock,
+    getFewShotExamples,
+    renderFewShotExamples
+} = require('./persona');
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const chatModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
 const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+
+// Streaming support: helper to convert model stream chunks to text parts
+async function streamModelToResponse(model, prompt, res, requestId, generationConfig = {}) {
+    // Server-Sent Events headers if not already set by platform
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+
+    // Small helper to send SSE data frames
+    const send = (event, data) => {
+        try {
+            res.write(`event: ${event}\n`);
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+        } catch (e) {
+            console.error(`[${requestId}] SSE write error:`, e?.message);
+        }
+    };
+
+    try {
+        // gemini streaming API
+        const start = Date.now();
+        const stream = await model.generateContentStream({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: {
+                maxOutputTokens: generationConfig.maxOutputTokens ?? 800,
+                temperature: generationConfig.temperature ?? 0.5,
+                topP: generationConfig.topP ?? 0.8,
+                topK: generationConfig.topK ?? 40
+            }
+        });
+
+        let full = '';
+        for await (const chunk of stream.stream) {
+            const text = chunk?.text() || '';
+            if (text) {
+                full += text;
+                send('token', { token: text });
+            }
+        }
+
+        performanceMonitor.recordGeneration(Date.now() - start);
+        send('done', { complete: true });
+
+        return full;
+    } catch (err) {
+        console.error(`[${requestId}] Streaming error:`, err);
+        send('error', { message: 'stream_failed' });
+        throw err;
+    }
+}
 
 // In-memory knowledge base cache
 let knowledgeBase = null;
@@ -39,7 +95,9 @@ const CONFIG = {
     intentConfidenceThreshold: 0.6,
     queryExpansionEnabled: true,
     adaptiveChunkRetrieval: true,
-    maxQueryExpansions: 2
+    maxQueryExpansions: 2,
+    // Feature flags
+    supportPersonaEnabled: truthyEnv(process.env.SUPPORT_PERSONA)
 };
 
 /**
@@ -54,9 +112,23 @@ module.exports = async (req, res) => {
     if (req.method === 'OPTIONS') {
         return res.status(200).end();
     }
+
+    // Support GET for simple health of this route and streaming preflight tests
+    if (req.method === 'GET') {
+        return res.status(200).json({
+            ok: true,
+            route: 'chat',
+            streaming: true,
+            persona: {
+                supportPersonaEnabled: CONFIG.supportPersonaEnabled,
+                overrideParam: 'persona', // send "senior_support" to enable per-request
+                acceptedValues: ['senior_support', null]
+            }
+        });
+    }
     
     if (req.method !== 'POST') {
-        return res.status(405).json({ 
+        return res.status(405).json({
             error: 'Method not allowed',
             code: 'METHOD_NOT_ALLOWED'
         });
@@ -67,7 +139,7 @@ module.exports = async (req, res) => {
     
     try {
         // Validate and parse request
-        const { message, sessionId } = req.body;
+        const { message, sessionId, stream, persona } = req.body;
         
         if (!message || typeof message !== 'string') {
             return res.status(400).json({
@@ -92,51 +164,97 @@ module.exports = async (req, res) => {
                 requestId
             });
         }
+
+        // Basic input safety/sanitization filter
+        const safety = basicSafetyGuard(message);
+        if (!safety.allowed) {
+            return res.status(400).json({
+                error: 'Message rejected by safety rules',
+                code: 'SAFETY_BLOCKED',
+                reason: safety.reason,
+                requestId
+            });
+        }
         
         // Initialize or update knowledge base
         await ensureKnowledgeBase();
         
-        // Process chat request
-        const response = await processChatRequest(message, sessionId, requestId);
-        const processingTime = Date.now() - startTime;
-        
-        // Record successful request
-        performanceMonitor.recordRequest(true, processingTime);
-        
-        // Return enhanced response with metrics
-        res.status(200).json({
-            ...response,
-            timestamp: Date.now(),
-            processingTime,
-            requestId,
-            systemMetrics: {
-                embeddingCacheHits: embeddingCache.size,
-                activeSessions: conversationContexts.size,
-                averageResponseTime: performanceMonitor.metrics.requests.averageResponseTime
-            }
+        // Process chat request (non-streaming path first)
+        if (!stream) {
+            const response = await processChatRequest(message, sessionId, requestId);
+            const processingTime = Date.now() - startTime;
+            
+            performanceMonitor.recordRequest(true, processingTime);
+            
+            return res.status(200).json({
+                ...response,
+                timestamp: Date.now(),
+                processingTime,
+                requestId,
+                systemMetrics: {
+                    embeddingCacheHits: embeddingCache.size,
+                    activeSessions: conversationContexts.size,
+                    averageResponseTime: performanceMonitor.metrics.requests.averageResponseTime
+                }
+            });
+        }
+
+        // Streaming path: reuse the internal pipeline to build prompt/context,
+        // but emit tokens as they are generated.
+        const conversationContext = getOrCreateConversationContext(sessionId, requestId);
+        const queryAnalysis = await analyzeQuery(message, conversationContext, requestId);
+        const retrievalResults = await performContextAwareRetrieval(queryAnalysis, conversationContext, requestId);
+        // Optional per-request persona override (does not persist)
+        if (typeof persona === 'string') {
+            conversationContext._requestPersona = persona;
+        }
+
+        // Build a deterministic dynamic prompt with slightly lower temperature for streaming
+        const contextBlock = retrievalResults.chunks.map(c => `- ${c.chunk.text}`).join('\n');
+        const history = conversationContext.messages
+            .slice(-6)
+            .map(msg => `${msg.type === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
+            .join('\n');
+        const prompt = buildDynamicPrompt(queryAnalysis, contextBlock, history, 'comprehensive', conversationContext);
+
+        const streamedText = await streamModelToResponse(chatModel, prompt, res, requestId, {
+            maxOutputTokens: getMaxTokensForResponseType('comprehensive'),
+            temperature: 0.4,
+            topP: 0.8,
+            topK: 40
         });
-        
+
+        // After stream completes, compute confidence and push to context once.
+        const finalConfidence = calculateResponseConfidence(retrievalResults, queryAnalysis, streamedText);
+        updateConversationContext(conversationContext, message, {
+            text: streamedText,
+            confidence: finalConfidence,
+            sources: retrievalResults.chunks.map(chunk => chunk.metadata?.source || 'knowledge_base').filter(Boolean)
+        }, queryAnalysis);
+
+        // End the response explicitly in some serverless runtimes
+        try { res.end(); } catch {}
+
     } catch (error) {
         console.error(`[${requestId}] Chat API error:`, error);
         
         const processingTime = Date.now() - startTime;
         
-        // Enhanced error handling with detailed categorization
         const errorResponse = categorizeError(error, requestId, processingTime);
         
-        // Record failed request
         performanceMonitor.recordRequest(false, processingTime);
         performanceMonitor.recordError(errorResponse.body.code);
         
-        return res.status(errorResponse.status).json(errorResponse.body);
-        
-        // This should not be reached due to categorizeError, but keeping as fallback
-        res.status(500).json({
-            error: 'Something went wrong. Please try again.',
-            code: 'INTERNAL_ERROR',
-            requestId,
-            processingTime
-        });
+        // If we were in SSE mode, try to emit as SSE error
+        try {
+            res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+            res.write(`event: error\n`);
+            res.write(`data: ${JSON.stringify(errorResponse.body)}\n\n`);
+            try { res.end(); } catch {}
+            return;
+        } catch (_e) {
+            return res.status(errorResponse.status).json(errorResponse.body);
+        }
     }
 };
 
@@ -1309,52 +1427,86 @@ async function generateContextAwareResponse(queryAnalysis, retrievalResults, con
  * Build dynamic prompt based on context and response type
  */
 function buildDynamicPrompt(queryAnalysis, context, conversationHistory, responseType, conversationContext) {
-    let basePrompt = `You are RagZzy, a helpful customer support assistant.`;
-    
-    // Add conversation context if available
+    // Determine persona enablement:
+    // 1) Per-request override via req.body.persona === 'senior_support'
+    // 2) Fallback to env flag SUPPORT_PERSONA
+    const enableSupportPersona = (conversationContext?._requestPersona === 'senior_support') || CONFIG.supportPersonaEnabled;
+
+    let sections = [];
+
+    // Optional persona block
+    if (enableSupportPersona) {
+        sections.push(buildSeniorSupportPersonaBlock());
+    }
+
+    // Base assistant identity
+    sections.push('You are RagZzy, a helpful customer support assistant.');
+
+    // Conversation history
     if (conversationHistory) {
-        basePrompt += `\n\nPrevious conversation:\n${conversationHistory}`;
+        sections.push(`Previous conversation:\n${conversationHistory}`);
     }
-    
-    // Add current context
+
+    // Retrieved context
     if (context) {
-        basePrompt += `\n\nRelevant information:\n${context}`;
+        sections.push(`Relevant information:\n${context}`);
     }
-    
-    // Add current query
-    basePrompt += `\n\nCurrent question: ${queryAnalysis.originalQuery}`;
-    
-    // Add contextual references if detected
+
+    // Current query and contextual refs
+    const parts = [`Current question: ${queryAnalysis.originalQuery}`];
     if (queryAnalysis.contextualReferences.length > 0) {
-        basePrompt += `\n\nNote: The user used references like "${queryAnalysis.contextualReferences.map(ref => ref.pronoun).join(', ')}" which may refer to previous discussion topics.`;
+        parts.push(
+            `Note: The user used references like "${queryAnalysis.contextualReferences.map(ref => ref.pronoun).join(', ')}" which may refer to previous discussion topics.`
+        );
     }
-    
-    // Response type specific instructions
+    sections.push(parts.join('\n'));
+
+    // Response type instructions
     const responseInstructions = {
         'comprehensive': 'Provide a detailed, thorough response that fully addresses the question. Include relevant details and context.',
         'concise': 'Provide a brief, direct answer that gets straight to the point while being helpful.',
         'explanatory': 'Provide a clear explanation with step-by-step details or background information to help the user understand.'
     };
-    
-    basePrompt += `\n\n${responseInstructions[responseType] || responseInstructions['comprehensive']}`;
-    
-    // Add personalization based on conversation history
-    if (conversationContext.successfulResponses > 2) {
-        basePrompt += ` The user has been having a good experience with previous responses, so maintain that helpful tone.`;
+    sections.push(responseInstructions[responseType] || responseInstructions['comprehensive']);
+
+    // Optional personalization (if available in this module)
+    try {
+        if (typeof getPersonalizedResponseInstructions === 'function' && conversationContext?.sessionId) {
+            const personalization = getPersonalizedResponseInstructions(conversationContext.sessionId, queryAnalysis);
+            if (personalization) {
+                sections.push(`Personalization: ${personalization}`);
+            }
+        }
+    } catch (_e) {
+        // ignore personalization errors
     }
-    
-    // Add intent-specific guidance
+
+    // Intent-specific guidance
     if (queryAnalysis.intent === 'clarification') {
-        basePrompt += ` The user is asking for clarification, so be extra clear and specific in your explanation.`;
+        sections.push('The user is asking for clarification, so be extra clear and specific in your explanation.');
     } else if (queryAnalysis.intent === 'complaint') {
-        basePrompt += ` The user seems to have an issue or concern. Be empathetic and solution-focused.`;
+        sections.push('The user seems to have an issue or concern. Be empathetic and solution-focused.');
     } else if (queryAnalysis.isFollowUp) {
-        basePrompt += ` This appears to be a follow-up question, so connect your response to the previous conversation.`;
+        sections.push('This appears to be a follow-up question, so connect your response to the previous conversation.');
     }
-    
-    basePrompt += `\n\nResponse:`;
-    
-    return basePrompt;
+
+    // Tone reinforcement based on recent success
+    if (conversationContext.successfulResponses > 2) {
+        sections.push('Maintain the same helpful, effective tone that worked well previously.');
+    }
+
+    // Few-shot examples for persona steering
+    if (enableSupportPersona) {
+        const fewShot = renderFewShotExamples(getFewShotExamples());
+        if (fewShot) {
+            sections.push(fewShot);
+        }
+    }
+
+    // Final cue
+    sections.push('Response:');
+
+    return sections.join('\n\n');
 }
 
 /**
@@ -1368,6 +1520,41 @@ function getMaxTokensForResponseType(responseType) {
     };
     
     return tokenLimits[responseType] || CONFIG.maxResponseTokens;
+}
+
+/**
+ * Basic safety guard: blocks obvious prompt-injection and disallowed content patterns.
+ * This is a lightweight layer; for production, add a full moderation pass.
+ */
+function basicSafetyGuard(text) {
+    const lower = text.toLowerCase();
+
+    // Simple prompt-injection keywords
+    const injection = [
+        'ignore previous', 'disregard previous', 'system prompt',
+        'developer instructions', 'reveal your prompt', 'print your rules'
+    ];
+
+    if (injection.some(k => lower.includes(k))) {
+        return { allowed: false, reason: 'possible_prompt_injection' };
+    }
+
+    // Extremely unsafe content quick checks (expand as needed)
+    const disallowed = [
+        /child\s*sexual\s*content/i,
+        /credit\s*card\s*number/i,
+        /social\s*security\s*number/i
+    ];
+    if (disallowed.some(rx => rx.test(text))) {
+        return { allowed: false, reason: 'disallowed_content' };
+    }
+
+    // Very long repeated characters
+    if (/(.)\1{20,}/.test(text)) {
+        return { allowed: false, reason: 'spam' };
+    }
+
+    return { allowed: true };
 }
 
 /**
@@ -2539,6 +2726,11 @@ function cleanupMemory() {
 
 // Run cleanup every 30 minutes
 setInterval(cleanupMemory, 30 * 60 * 1000);
+
+// Simple runtime log to confirm persona flag at boot (once)
+try {
+    console.log(`[boot] SUPPORT_PERSONA=${process.env.SUPPORT_PERSONA ?? '(unset)'} -> enabled=${CONFIG.supportPersonaEnabled}`);
+} catch (_) {}
 
 // Export for use in contribution endpoint and other modules
 module.exports.addUserContribution = addUserContribution;

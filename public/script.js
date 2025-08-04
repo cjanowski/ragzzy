@@ -275,45 +275,49 @@ class RagzzyChatApp {
     async sendMessage() {
         const message = this.elements.messageInput.value.trim();
         if (!message || this.isTyping) return;
-        
+
         // Add user message to chat
         this.addMessage(message, 'user');
-        
+
         // Clear input and update UI
         this.elements.messageInput.value = '';
         this.autoResize();
         this.updateCharCounter();
         this.toggleSendButton();
-        
+
         // Show typing indicator and progress
         this.showTypingIndicator();
         this.showProgress(true);
-        
+
         try {
-            const response = await this.callChatAPI(message);
-            this.hideTypingIndicator();
-            this.showProgress(false);
-            
-            if (response.error) {
-                this.showError(response.error);
-                return;
+            // Prefer streaming; if SSE fails, fall back to JSON.
+            const streamed = await this.callChatAPIStream(message);
+            if (!streamed.ok) {
+                const response = await this.callChatAPI(message);
+                this.hideTypingIndicator();
+                this.showProgress(false);
+
+                if (response.error) {
+                    this.showError(response.error);
+                    return;
+                }
+
+                this.addMessage(response.response, 'bot', {
+                    confidence: response.confidence,
+                    sources: response.sources,
+                    processingTime: response.processingTime
+                });
+
+                this.playNotificationSound();
+                if (response.contributionPrompt && response.contributionPrompt.show && this.contributionsEnabled) {
+                    this.showContributionLink(response.contributionPrompt.message);
+                }
+            } else {
+                // Streaming path already appended tokens and finished.
+                this.hideTypingIndicator();
+                this.showProgress(false);
+                this.playNotificationSound();
             }
-            
-            // Add bot response
-            this.addMessage(response.response, 'bot', {
-                confidence: response.confidence,
-                sources: response.sources,
-                processingTime: response.processingTime
-            });
-            
-            // Play notification sound for bot responses
-            this.playNotificationSound();
-            
-            // Handle contribution prompt if present and enabled in settings
-            if (response.contributionPrompt && response.contributionPrompt.show && this.contributionsEnabled) {
-                this.showContributionLink(response.contributionPrompt.message);
-            }
-            
         } catch (error) {
             this.hideTypingIndicator();
             this.showProgress(false);
@@ -325,21 +329,153 @@ class RagzzyChatApp {
     async callChatAPI(message) {
         const response = await fetch('/api/chat', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                message: message,
+                message,
                 sessionId: this.sessionId,
                 timestamp: Date.now()
             })
         });
-        
+
         if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            // Try to parse json error
+            let err = { error: `HTTP ${response.status}: ${response.statusText}` };
+            try { err = await response.json(); } catch {}
+            throw new Error(err.error || 'Request failed');
         }
-        
+
         return await response.json();
+    }
+
+    // Streaming via Server-Sent Events with fetch-readable fallback
+    async callChatAPIStream(message) {
+        // Create a placeholder bot message to progressively update
+        const placeholder = this.createStreamingMessageShell();
+
+        try {
+            const resp = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    message,
+                    sessionId: this.sessionId,
+                    timestamp: Date.now(),
+                    stream: true
+                })
+            });
+
+            // If server returns JSON (non-SSE), bail out to non-stream path
+            const ctype = resp.headers.get('content-type') || '';
+            if (!ctype.includes('text/event-stream')) {
+                // remove placeholder if any text present
+                if (placeholder && placeholder.parentNode) placeholder.parentNode.removeChild(placeholder);
+                return { ok: false };
+            }
+
+            // Parse SSE manually from the ReadableStream
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+            let accumulated = '';
+
+            const processBuffer = () => {
+                const parts = buffer.split('\n\n');
+                // Keep last partial chunk in buffer
+                buffer = parts.pop() || '';
+                for (const part of parts) {
+                    const lines = part.split('\n');
+                    let event = 'message';
+                    let dataLines = [];
+                    for (const line of lines) {
+                        if (line.startsWith('event:')) {
+                            event = line.slice(6).trim();
+                        } else if (line.startsWith('data:')) {
+                            dataLines.push(line.slice(5).trim());
+                        }
+                    }
+                    const dataStr = dataLines.join('\n');
+                    if (!dataStr) continue;
+                    try {
+                        const payload = JSON.parse(dataStr);
+                        if (event === 'token' && payload.token) {
+                            accumulated += payload.token;
+                            this.updateStreamingMessage(placeholder, accumulated);
+                        } else if (event === 'error') {
+                            throw new Error(payload.message || 'stream_error');
+                        } else if (event === 'done') {
+                            // finalize message with minimal metadata (confidence computed server-side after stream)
+                            this.finalizeStreamingMessage(placeholder, accumulated);
+                        }
+                    } catch (e) {
+                        // Non-JSON data; append raw
+                        if (event === 'token') {
+                            accumulated += dataStr;
+                            this.updateStreamingMessage(placeholder, accumulated);
+                        }
+                    }
+                }
+            };
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                processBuffer();
+            }
+            // Flush remaining buffer
+            buffer += decoder.decode();
+            processBuffer();
+
+            return { ok: true };
+        } catch (e) {
+            // Remove placeholder on failure to allow fallback path to render cleanly
+            if (placeholder && placeholder.parentNode) placeholder.parentNode.removeChild(placeholder);
+            return { ok: false, error: e?.message || 'stream_failed' };
+        }
+    }
+
+    createStreamingMessageShell() {
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'message bot-message';
+        messageDiv.setAttribute('role', 'article');
+
+        const avatar = document.createElement('div');
+        avatar.className = 'message-avatar';
+        avatar.innerHTML = `<div class="avatar bot-avatar">🤖</div>`;
+
+        const content = document.createElement('div');
+        content.className = 'message-content';
+
+        const messageText = document.createElement('div');
+        messageText.className = 'message-text';
+        messageText.innerHTML = '';
+
+        const meta = document.createElement('div');
+        meta.className = 'message-time';
+        meta.textContent = new Date().toLocaleTimeString();
+
+        content.appendChild(messageText);
+        content.appendChild(meta);
+        messageDiv.appendChild(avatar);
+        messageDiv.appendChild(content);
+
+        this.elements.messagesContainer.appendChild(messageDiv);
+        this.scrollToBottom();
+
+        // Attach for updates
+        messageDiv.__textEl = messageText;
+        return messageDiv;
+    }
+
+    updateStreamingMessage(placeholder, text) {
+        if (!placeholder || !placeholder.__textEl) return;
+        placeholder.__textEl.innerHTML = this.formatMessage(text);
+        this.scrollToBottom();
+    }
+
+    finalizeStreamingMessage(placeholder, text) {
+        this.updateStreamingMessage(placeholder, text);
+        // Could append metadata when metrics arrive via non-stream path; for now just finalize.
     }
     
     addMessage(text, sender, metadata = {}) {
@@ -396,6 +532,9 @@ class RagzzyChatApp {
     formatMessage(text) {
         // Basic formatting - convert line breaks and handle basic markdown
         return text
+            .replace(/&/g, '&')
+            .replace(/</g, '<')
+            .replace(/>/g, '>')
             .replace(/\n/g, '<br>')
             .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
             .replace(/\*(.*?)\*/g, '<em>$1</em>')
