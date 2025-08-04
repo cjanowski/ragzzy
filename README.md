@@ -124,26 +124,6 @@ Contribute knowledge to the system.
 }
 ```
 
-## Development
-
-### Testing
-
-```bash
-npm test
-```
-
-### Linting
-
-```bash
-npm run lint
-```
-
-### Local Development
-
-```bash
-vercel dev
-```
-
 ## Contributing
 
 1. Fork the repository
