@@ -5,7 +5,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const { generateEmbedding } = require('./chat');
 
 // Configuration
 const CONFIG = {
