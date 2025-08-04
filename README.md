@@ -2,7 +2,8 @@
 ## Visit Here: [RagZzy](https://ragzzy.vercel.app/)
 A RAG-powered customer support chatbot that learns from user interactions and contributions.
 
-<img width="1512" height="821" alt="Screenshot 2025-08-03 at 9 01 11 PM" src="https://github.com/user-attachments/assets/70b3930e-b0df-4273-8d84-7c2da2d9c517" />
+
+<img width="571" height="766" alt="Screenshot 2025-08-04 at 6 35 48 AM" src="https://github.com/user-attachments/assets/37e7c049-c34f-4873-9e9e-08392b2401cf" />
 
 ## Features
 
