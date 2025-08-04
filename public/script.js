@@ -284,7 +284,12 @@ class RagzzyChatApp {
         if (sender === 'bot' && metadata.confidence !== undefined) {
             const metadataDiv = document.createElement('div');
             metadataDiv.className = 'message-metadata';
-            metadataDiv.innerHTML = `\n                <small style=\"color: #6b7280; font-size: 0.75rem;\">\n                    Confidence: ${Math.round(metadata.confidence * 100)}%\n                    ${metadata.processingTime ? ` • ${metadata.processingTime}ms` : ''}\n                </small>\n            `;
+            metadataDiv.innerHTML = `
+                <small style=\"color: #6b7280; font-size: 0.75rem;\">
+                    Confidence: ${Math.round(metadata.confidence * 100)}%
+                    ${metadata.processingTime ? ` • ${metadata.processingTime}ms` : ''}
+                </small>
+            `;
             messageText.appendChild(metadataDiv);
         }
         
@@ -309,7 +314,8 @@ class RagzzyChatApp {
     formatMessage(text) {
         // Basic formatting - convert line breaks and handle basic markdown
         return text
-            .replace(/\n/g, '<br>')
+            .replace(/
+/g, '<br>')
             .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
             .replace(/\*(.*?)\*/g, '<em>$1</em>')
             .replace(/`(.*?)`/g, '<code>$1</code>');
@@ -337,7 +343,14 @@ class RagzzyChatApp {
     showContributionPrompt(message, originalQuestion) {
         const promptDiv = document.createElement('div');
         promptDiv.className = 'contribution-prompt';
-        promptDiv.innerHTML = `\n            <h4>💡 Help Improve My Knowledge</h4>\n            <p>${message}</p>\n            <div class=\"contribution-actions\">\n                <button class=\"btn btn-secondary\" onclick=\"this.parentElement.parentElement.remove()\">Not now</button>\n                <button class=\"btn btn-primary\" onclick=\"ragzzyApp.showContributionModal('${originalQuestion.replace(/'/g, \"\\'\")}')\">Help Out</button>\n            </div>\n        `;
+        promptDiv.innerHTML = `
+            <h4>💡 Help Improve My Knowledge</h4>
+            <p>${message}</p>
+            <div class="contribution-actions">
+                <button class="btn btn-secondary" onclick="this.parentElement.parentElement.remove()">Not now</button>
+                <button class="btn btn-primary" onclick="ragzzyApp.showContributionModal(\`${originalQuestion.replace(/'/g, "\\'")}\`)">Help Out</button>
+            </div>
+        `;
         
         this.elements.messagesContainer.appendChild(promptDiv);
         this.scrollToBottom();
@@ -368,4 +381,181 @@ class RagzzyChatApp {
             source: 'user'
         };
         
-        // Validation\n        if (!contribution.question || contribution.question.length < 5) {\n            this.showError('Please provide a question (at least 5 characters)');\n            return;\n        }\n        \n        if (!contribution.answer || contribution.answer.length < 10) {\n            this.showError('Please provide an answer (at least 10 characters)');\n            return;\n        }\n        \n        if (contribution.answer.length > 2000) {\n            this.showError('Answer is too long (maximum 2000 characters)');\n            return;\n        }\n        \n        // Show loading state\n        this.elements.submitContribution.classList.add('loading');\n        this.elements.submitContribution.disabled = true;\n        \n        try {\n            const response = await fetch('/api/contribute', {\n                method: 'POST',\n                headers: {\n                    'Content-Type': 'application/json',\n                },\n                body: JSON.stringify(contribution)\n            });\n            \n            const result = await response.json();\n            \n            if (result.success) {\n                this.hideContributionModal();\n                this.showSuccess(result.message || 'Thank you for your contribution!');\n                \n                // Show suggested prompts if available\n                if (result.suggestedPrompts && result.suggestedPrompts.length > 0) {\n                    this.showSuggestedPrompts(result.suggestedPrompts);\n                }\n            } else {\n                this.showError(result.message || 'Failed to add your contribution. Please try again.');\n            }\n            \n        } catch (error) {\n            console.error('Contribution error:', error);\n            this.showError('Sorry, there was a problem submitting your contribution. Please try again.');\n        } finally {\n            // Reset loading state\n            this.elements.submitContribution.classList.remove('loading');\n            this.elements.submitContribution.disabled = false;\n        }\n    }\n    \n    showSuggestedPrompts(prompts) {\n        const suggestionDiv = document.createElement('div');\n        suggestionDiv.className = 'knowledge-prompt';\n        \n        let promptsHtml = prompts.map(prompt => \n            `<div class=\"guided-prompt-item\" onclick=\"ragzzyApp.showContributionModal('${prompt.question.replace(/'/g, \"\\'\")}')\">                ${prompt.question}            </div>`\n        ).join('');\n        \n        suggestionDiv.innerHTML = `\n            <div class=\"prompt-header\">\n                <h3>🌟 More Ways to Help</h3>\n                <p>Here are some related questions you could help with:</p>\n            </div>\n            <div class=\"guided-prompts\">${promptsHtml}</div>\n            <div class=\"prompt-actions\">\n                <button class=\"btn btn-secondary\" onclick=\"this.parentElement.parentElement.remove()\">Maybe later</button>\n            </div>\n        `;\n        \n        this.elements.messagesContainer.appendChild(suggestionDiv);\n        this.scrollToBottom();\n    }\n    \n    loadGuidedPrompts() {\n        // Default guided prompts - in a real app, these might come from the API\n        this.guidedPrompts = [\n            {\n                id: 'business-hours',\n                question: 'What are your business hours?',\n                category: 'business-info',\n                required: true\n            },\n            {\n                id: 'contact-info',\n                question: 'How can customers contact support?',\n                category: 'business-info',\n                required: true\n            },\n            {\n                id: 'main-products',\n                question: 'What are your main products or services?',\n                category: 'products',\n                required: true\n            },\n            {\n                id: 'pricing-info',\n                question: 'What is your pricing structure?',\n                category: 'pricing',\n                required: false\n            },\n            {\n                id: 'return-policy',\n                question: 'What is your return/refund policy?',\n                category: 'policies',\n                required: false\n            }\n        ];\n        \n        // Show knowledge prompt after a delay\n        setTimeout(() => {\n            this.showKnowledgePrompt();\n        }, 5000);\n    }\n    \n    showKnowledgePrompt() {\n        const guidedPromptsHtml = this.guidedPrompts.map(prompt => \n            `<div class=\"guided-prompt-item ${prompt.required ? 'required' : ''}\" onclick=\"ragzzyApp.showContributionModal('${prompt.question.replace(/'/g, \"\\'\")}')\">                ${prompt.question}            </div>`\n        ).join('');\n        \n        document.getElementById('guidedPrompts').innerHTML = guidedPromptsHtml;\n        this.elements.knowledgePrompt.style.display = 'block';\n        this.scrollToBottom();\n    }\n    \n    hideKnowledgePrompt() {\n        this.elements.knowledgePrompt.style.display = 'none';\n    }\n    \n    showError(message) {\n        this.elements.errorMessage.textContent = message;\n        this.elements.errorToast.style.display = 'flex';\n        \n        // Auto-hide after 5 seconds\n        setTimeout(() => {\n            this.hideToast('error');\n        }, 5000);\n    }\n    \n    showSuccess(message) {\n        this.elements.successMessage.textContent = message;\n        this.elements.successToast.style.display = 'flex';\n        \n        // Auto-hide after 3 seconds\n        setTimeout(() => {\n            this.hideToast('success');\n        }, 3000);\n    }\n    \n    hideToast(type) {\n        if (type === 'error') {\n            this.elements.errorToast.style.display = 'none';\n        } else if (type === 'success') {\n            this.elements.successToast.style.display = 'none';\n        }\n    }\n    \n    // Utility method for external calls\n    contributeKnowledge(question, answer) {\n        this.showContributionModal(question);\n        if (answer) {\n            this.elements.contributionAnswer.value = answer;\n            this.updateContributionCharCounter();\n        }\n    }\n}\n\n// Initialize the app when DOM is loaded\nlet ragzzyApp;\n\ndocument.addEventListener('DOMContentLoaded', () => {\n    ragzzyApp = new RagzzyChatApp();\n});\n\n// Make app globally available for onclick handlers\nwindow.ragzzyApp = ragzzyApp;"
+        // Validation
+        if (!contribution.question || contribution.question.length < 5) {
+            this.showError('Please provide a question (at least 5 characters)');
+            return;
+        }
+        
+        if (!contribution.answer || contribution.answer.length < 10) {
+            this.showError('Please provide an answer (at least 10 characters)');
+            return;
+        }
+        
+        if (contribution.answer.length > 2000) {
+            this.showError('Answer is too long (maximum 2000 characters)');
+            return;
+        }
+        
+        // Show loading state
+        this.elements.submitContribution.classList.add('loading');
+        this.elements.submitContribution.disabled = true;
+        
+        try {
+            const response = await fetch('/api/contribute', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(contribution)
+            });
+            
+            const result = await response.json();
+            
+            if (result.success) {
+                this.hideContributionModal();
+                this.showSuccess(result.message || 'Thank you for your contribution!');
+                
+                // Show suggested prompts if available
+                if (result.suggestedPrompts && result.suggestedPrompts.length > 0) {
+                    this.showSuggestedPrompts(result.suggestedPrompts);
+                }
+            } else {
+                this.showError(result.message || 'Failed to add your contribution. Please try again.');
+            }
+            
+        } catch (error) {
+            console.error('Contribution error:', error);
+            this.showError('Sorry, there was a problem submitting your contribution. Please try again.');
+        } finally {
+            // Reset loading state
+            this.elements.submitContribution.classList.remove('loading');
+            this.elements.submitContribution.disabled = false;
+        }
+    }
+    
+    showSuggestedPrompts(prompts) {
+        const suggestionDiv = document.createElement('div');
+        suggestionDiv.className = 'knowledge-prompt';
+        
+        let promptsHtml = prompts.map(prompt => 
+            `<div class=\"guided-prompt-item\" onclick=\"ragzzyApp.showContributionModal('${prompt.question.replace(/'/g, \"\\'\")}')\">                ${prompt.question}            </div>`
+        ).join('');
+        
+        suggestionDiv.innerHTML = `
+            <div class=\"prompt-header\">
+                <h3>🌟 More Ways to Help</h3>
+                <p>Here are some related questions you could help with:</p>
+            </div>
+            <div class=\"guided-prompts\">${promptsHtml}</div>
+            <div class=\"prompt-actions\">
+                <button class=\"btn btn-secondary\" onclick=\"this.parentElement.parentElement.remove()\">Maybe later</button>
+            </div>
+        `;
+        
+        this.elements.messagesContainer.appendChild(suggestionDiv);
+        this.scrollToBottom();
+    }
+    
+    loadGuidedPrompts() {
+        // Default guided prompts - in a real app, these might come from the API
+        this.guidedPrompts = [
+            {
+                id: 'business-hours',
+                question: 'What are your business hours?',
+                category: 'business-info',
+                required: true
+            },
+            {
+                id: 'contact-info',
+                question: 'How can customers contact support?',
+                category: 'business-info',
+                required: true
+            },
+            {
+                id: 'main-products',
+                question: 'What are your main products or services?',
+                category: 'products',
+                required: true
+            },
+            {
+                id: 'pricing-info',
+                question: 'What is your pricing structure?',
+                category: 'pricing',
+                required: false
+            },
+            {
+                id: 'return-policy',
+                question: 'What is your return/refund policy?',
+                category: 'policies',
+                required: false
+            }
+        ];
+        
+        // Show knowledge prompt after a delay
+        setTimeout(() => {
+            this.showKnowledgePrompt();
+        }, 5000);
+    }
+    
+    showKnowledgePrompt() {
+        const guidedPromptsHtml = this.guidedPrompts.map(prompt => 
+            `<div class=\"guided-prompt-item ${prompt.required ? 'required' : ''}\" onclick=\"ragzzyApp.showContributionModal('${prompt.question.replace(/'/g, \"\\'\")}')\">                ${prompt.question}            </div>`
+        ).join('');
+        
+        document.getElementById('guidedPrompts').innerHTML = guidedPromptsHtml;
+        this.elements.knowledgePrompt.style.display = 'block';
+        this.scrollToBottom();
+    }
+    
+    hideKnowledgePrompt() {
+        this.elements.knowledgePrompt.style.display = 'none';
+    }
+    
+    showError(message) {
+        this.elements.errorMessage.textContent = message;
+        this.elements.errorToast.style.display = 'flex';
+        
+        // Auto-hide after 5 seconds
+        setTimeout(() => {
+            this.hideToast('error');
+        }, 5000);
+    }
+    
+    showSuccess(message) {
+        this.elements.successMessage.textContent = message;
+        this.elements.successToast.style.display = 'flex';
+        
+        // Auto-hide after 3 seconds
+        setTimeout(() => {
+            this.hideToast('success');
+        }, 3000);
+    }
+    
+    hideToast(type) {
+        if (type === 'error') {
+            this.elements.errorToast.style.display = 'none';
+        } else if (type === 'success') {
+            this.elements.successToast.style.display = 'none';
+        }
+    }
+    
+    // Utility method for external calls
+    contributeKnowledge(question, answer) {
+        this.showContributionModal(question);
+        if (answer) {
+            this.elements.contributionAnswer.value = answer;
+            this.updateContributionCharCounter();
+        }
+    }
+}
+
+// Initialize the app when DOM is loaded
+let ragzzyApp;
+
+document.addEventListener('DOMContentLoaded', () => {
+    ragzzyApp = new RagzzyChatApp();
+});
+
+// Make app globally available for onclick handlers
+window.ragzzyApp = ragzzyApp;"
