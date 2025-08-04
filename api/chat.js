@@ -541,4 +541,4 @@ ${answer}`;
 
 // Export for use in contribution endpoint
 module.exports.addUserContribution = addUserContribution;
-module.exports.generateEmbedding = generateEmbedding;"
+module.exports.generateEmbedding = generateEmbedding;
