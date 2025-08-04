@@ -367,7 +367,7 @@ class RagzzyChatApp {
             // If server returns JSON (non-SSE), bail out to non-stream path
             const ctype = resp.headers.get('content-type') || '';
             if (!ctype.includes('text/event-stream')) {
-                // remove placeholder if any text present
+                // remove placeholder outright, fallback to JSON path
                 if (placeholder && placeholder.parentNode) placeholder.parentNode.removeChild(placeholder);
                 return { ok: false };
             }
@@ -377,6 +377,7 @@ class RagzzyChatApp {
             const decoder = new TextDecoder('utf-8');
             let buffer = '';
             let accumulated = '';
+            let sawErrorEvent = false;
 
             const processBuffer = () => {
                 const parts = buffer.split('\n\n');
@@ -401,13 +402,14 @@ class RagzzyChatApp {
                             accumulated += payload.token;
                             this.updateStreamingMessage(placeholder, accumulated);
                         } else if (event === 'error') {
-                            throw new Error(payload.message || 'stream_error');
+                            // On error event from server, mark and stop streaming gracefully
+                            sawErrorEvent = true;
                         } else if (event === 'done') {
                             // finalize message with minimal metadata (confidence computed server-side after stream)
                             this.finalizeStreamingMessage(placeholder, accumulated);
                         }
                     } catch (e) {
-                        // Non-JSON data; append raw
+                        // Non-JSON data; append raw on token events
                         if (event === 'token') {
                             accumulated += dataStr;
                             this.updateStreamingMessage(placeholder, accumulated);
@@ -421,11 +423,20 @@ class RagzzyChatApp {
                 if (done) break;
                 buffer += decoder.decode(value, { stream: true });
                 processBuffer();
+                // If server signaled error, stop reading further
+                if (sawErrorEvent) break;
             }
             // Flush remaining buffer
             buffer += decoder.decode();
             processBuffer();
 
+            if (sawErrorEvent) {
+                // Remove placeholder and signal fallback to JSON path
+                if (placeholder && placeholder.parentNode) placeholder.parentNode.removeChild(placeholder);
+                return { ok: false, error: 'sse_error_event' };
+            }
+
+            // If no text accumulated and no error, still treat as ok (server may have emitted fallback token)
             return { ok: true };
         } catch (e) {
             // Remove placeholder on failure to allow fallback path to render cleanly

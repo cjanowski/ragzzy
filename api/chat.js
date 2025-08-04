@@ -45,6 +45,9 @@ async function streamModelToResponse(model, prompt, res, requestId, generationCo
         }
     };
 
+    let full = '';
+    let emittedAnyToken = false;
+
     try {
         // gemini streaming API
         const start = Date.now();
@@ -58,12 +61,12 @@ async function streamModelToResponse(model, prompt, res, requestId, generationCo
             }
         });
 
-        let full = '';
         for await (const chunk of stream.stream) {
             const text = chunk?.text() || '';
             if (text) {
                 full += text;
                 send('token', { token: text });
+                emittedAnyToken = true;
             }
         }
 
@@ -73,8 +76,21 @@ async function streamModelToResponse(model, prompt, res, requestId, generationCo
         return full;
     } catch (err) {
         console.error(`[${requestId}] Streaming error:`, err);
-        send('error', { message: 'stream_failed' });
-        throw err;
+        // If nothing was emitted, emit a minimal friendly token to avoid blank bubble
+        if (!emittedAnyToken) {
+            const fallback = "I'm having trouble generating a response right now. Please try again in a moment.";
+            full = fallback;
+            try {
+                send('token', { token: fallback });
+                send('done', { complete: true });
+            } catch (_e) {}
+            // Return gracefully without throwing so caller flow can continue
+            return full;
+        }
+        // If some tokens already emitted, try to close cleanly
+        try { send('done', { complete: true }); } catch (_e) {}
+        // Return what we have
+        return full;
     }
 }
 
@@ -177,6 +193,16 @@ module.exports = async (req, res) => {
     try {
         // Validate and parse request
         const { message, sessionId, stream, persona } = req.body;
+
+        // Early guard: if client requested stream but the model key is missing, return JSON error
+        if (stream && !process.env.GEMINI_API_KEY) {
+            return res.status(503).json({
+                error: 'AI service not configured',
+                code: 'AI_CONFIG_MISSING',
+                requestId,
+                retryable: false
+            });
+        }
         
         if (!message || typeof message !== 'string') {
             return res.status(400).json({
