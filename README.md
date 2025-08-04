@@ -74,36 +74,6 @@ Another answer with more details.
 
 Each Q&A pair should be separated by a blank line.
 
-## API Endpoints
-
-### POST /api/chat
-
-Chat with the bot.
-
-**Request:**
-```json
-{
-  "message": "What are your business hours?",
-  "sessionId": "optional-session-id"
-}
-```
-
-**Response:**
-```json
-{
-  "response": "Our business hours are...",
-  "confidence": 0.95,
-  "sources": ["knowledge_base.txt"],
-  "timestamp": 1234567890,
-  "processingTime": 1250,
-  "contributionPrompt": {
-    "show": false
-  }
-}
-```
-
-### POST /api/contribute
-
 Contribute knowledge to the system.
 
 **Request:**
@@ -134,13 +104,9 @@ Contribute knowledge to the system.
 4. Add tests if applicable
 5. Submit a pull request
 
-## License
-
-MIT License - see LICENSE file for details
-
 ## Support
 
 For questions or issues:
 - Create an issue in this repository
-- Email: support@ragzzy.com
+- Email: coryjanowski@gmail.com
 - Check the knowledge base in the chat interface# ragzzy
