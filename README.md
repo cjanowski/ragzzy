@@ -172,15 +172,6 @@ Outputs:
 
 ---
 
-## What Employers Should Notice
-
-- Clear separation of concerns and pragmatic guards around async, streaming, and validation.
-- Measurable quality via the offline evaluator with structured metrics.
-- Thoughtful defaults and configuration knobs for persona, few‑shot, and retrieval budgets.
-- Safe fallbacks (JSON parse guards, empty KB handling, MiniSearch fallbacks).
-
----
-
 ## Roadmap Ideas
 
 - Add golden answer assertions to eval (precision/recall with pattern banks).
@@ -192,5 +183,4 @@ Outputs:
 ---
 
 ## License
-
-ISC
+Not Licensed for use
