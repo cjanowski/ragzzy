@@ -4,12 +4,12 @@
   "description": "RAG-powered customer support chatbot that learns from user contributions",
   "main": "api/chat.js",
   "scripts": {
-    "dev": "vercel dev",
+    "dev": "node -e \"console.log('Use: vercel dev')\"",
     "build": "echo \"Static files - no build needed\"",
     "deploy": "vercel --prod",
     "test": "echo \"No tests specified yet\" && exit 0",
     "lint": "echo \"No linting configured yet\"",
-    "start": "vercel dev"
+    "start": "node -e \"console.log('Use: vercel dev')\""
   },
   "keywords": ["chatbot", "rag", "ai", "customer-support", "gemini", "knowledge-base"],
   "author": "",

@@ -4,12 +4,12 @@ A RAG-powered customer support chatbot that learns from user interactions and co
 
 ## Features
 
-- 🤖 **AI-Powered Responses**: Uses Google Gemini for intelligent, context-aware responses
-- 📚 **Dynamic Knowledge Base**: Learns from user contributions in real-time
-- 🎯 **Guided Knowledge Collection**: Prompts users with specific questions to build comprehensive knowledge
-- 🔍 **Smart Retrieval**: Uses semantic search to find relevant information
-- 📱 **Responsive Design**: Works seamlessly on desktop and mobile devices
-- ⚡ **Fast & Reliable**: Deployed on Vercel with optimized performance
+-  **AI-Powered Responses**: Uses Google Gemini for intelligent, context-aware responses
+-  **Dynamic Knowledge Base**: Learns from user contributions in real-time
+-  **Guided Knowledge Collection**: Prompts users with specific questions to build comprehensive knowledge
+-  **Smart Retrieval**: Uses semantic search to find relevant information
+-  **Responsive Design**: Works seamlessly on desktop and mobile devices
+-  **Fast & Reliable**: Deployed on Vercel with optimized performance
 
 ## How It Works
 

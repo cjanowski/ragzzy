@@ -1,1 +1,546 @@
-/**\n * RagZzy Chat API - Main chat endpoint with RAG functionality\n * Handles user queries, retrieval-augmented generation, and knowledge contribution prompts\n */\n\nconst { GoogleGenerativeAI } = require('@google/generative-ai');\nconst fs = require('fs');\nconst path = require('path');\n\n// Initialize Gemini AI\nconst genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);\nconst chatModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });\nconst embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });\n\n// In-memory knowledge base cache\nlet knowledgeBase = null;\nlet lastProcessed = 0;\n\n// Configuration\nconst CONFIG = {\n    confidenceThreshold: parseFloat(process.env.CONFIDENCE_THRESHOLD) || 0.3,\n    maxRetrievalChunks: 5,\n    chunkSize: 500,\n    chunkOverlap: 50,\n    maxResponseTokens: 1000\n};\n\n/**\n * Main request handler\n */\nmodule.exports = async (req, res) => {\n    // Set CORS headers\n    res.setHeader('Access-Control-Allow-Origin', '*');\n    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');\n    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');\n    \n    if (req.method === 'OPTIONS') {\n        return res.status(200).end();\n    }\n    \n    if (req.method !== 'POST') {\n        return res.status(405).json({ \n            error: 'Method not allowed',\n            code: 'METHOD_NOT_ALLOWED'\n        });\n    }\n    \n    const startTime = Date.now();\n    const requestId = generateRequestId();\n    \n    try {\n        // Validate and parse request\n        const { message, sessionId } = req.body;\n        \n        if (!message || typeof message !== 'string') {\n            return res.status(400).json({\n                error: 'Message is required',\n                code: 'INVALID_INPUT',\n                requestId\n            });\n        }\n        \n        if (message.length > 1000) {\n            return res.status(400).json({\n                error: 'Message too long (max 1000 characters)',\n                code: 'MESSAGE_TOO_LONG',\n                requestId\n            });\n        }\n        \n        if (message.trim().length < 1) {\n            return res.status(400).json({\n                error: 'Message cannot be empty',\n                code: 'EMPTY_MESSAGE',\n                requestId\n            });\n        }\n        \n        // Initialize or update knowledge base\n        await ensureKnowledgeBase();\n        \n        // Process chat request\n        const response = await processChatRequest(message, sessionId, requestId);\n        const processingTime = Date.now() - startTime;\n        \n        // Return response\n        res.status(200).json({\n            ...response,\n            timestamp: Date.now(),\n            processingTime,\n            requestId\n        });\n        \n    } catch (error) {\n        console.error(`[${requestId}] Chat API error:`, error);\n        \n        const processingTime = Date.now() - startTime;\n        \n        // Handle specific error types\n        if (error.message?.includes('API key')) {\n            return res.status(500).json({\n                error: 'Service temporarily unavailable',\n                code: 'SERVICE_ERROR',\n                requestId,\n                processingTime\n            });\n        }\n        \n        if (error.message?.includes('quota') || error.message?.includes('rate limit')) {\n            return res.status(429).json({\n                error: 'Too many requests. Please try again in a moment.',\n                code: 'RATE_LIMITED',\n                requestId,\n                processingTime\n            });\n        }\n        \n        // Generic error response\n        res.status(500).json({\n            error: 'Something went wrong. Please try again.',\n            code: 'INTERNAL_ERROR',\n            requestId,\n            processingTime\n        });\n    }\n};\n\n/**\n * Process the chat request using RAG\n */\nasync function processChatRequest(message, sessionId, requestId) {\n    try {\n        // Generate embedding for user query\n        const queryEmbedding = await generateEmbedding(message);\n        \n        // Retrieve relevant knowledge chunks\n        const retrievedChunks = searchSimilarChunks(queryEmbedding, CONFIG.maxRetrievalChunks);\n        \n        // Calculate confidence based on best similarity score\n        const confidence = retrievedChunks.length > 0 ? retrievedChunks[0].similarity : 0;\n        \n        // Generate response using retrieved context\n        const response = await generateResponse(message, retrievedChunks);\n        \n        // Determine if we should prompt for contribution\n        const shouldPromptContribution = confidence < CONFIG.confidenceThreshold && \n                                       message.length > 10 && \n                                       !isSpamOrInappropriate(message);\n        \n        const result = {\n            response: response,\n            confidence: confidence,\n            sources: retrievedChunks.map(chunk => chunk.metadata?.source || 'knowledge_base').filter(Boolean)\n        };\n        \n        // Add contribution prompt if needed\n        if (shouldPromptContribution) {\n            result.contributionPrompt = {\n                show: true,\n                message: \"I don't have enough information to fully answer that question. Would you like to help by providing the answer?\",\n                suggestedPrompts: getRelevantGuidedPrompts(message)\n            };\n        } else {\n            result.contributionPrompt = {\n                show: false\n            };\n        }\n        \n        return result;\n        \n    } catch (error) {\n        console.error(`[${requestId}] RAG processing error:`, error);\n        throw error;\n    }\n}\n\n/**\n * Ensure knowledge base is loaded and up-to-date\n */\nasync function ensureKnowledgeBase() {\n    try {\n        const knowledgeBasePath = path.join(process.cwd(), 'knowledge_base.txt');\n        \n        // Check if file exists\n        if (!fs.existsSync(knowledgeBasePath)) {\n            console.warn('Knowledge base file not found, creating empty knowledge base');\n            knowledgeBase = {\n                chunks: [],\n                embeddings: [],\n                metadata: {\n                    totalChunks: 0,\n                    lastProcessed: Date.now(),\n                    version: '1.0'\n                }\n            };\n            return;\n        }\n        \n        const stats = fs.statSync(knowledgeBasePath);\n        const fileModified = stats.mtime.getTime();\n        \n        // Check if we need to reload\n        if (!knowledgeBase || fileModified > lastProcessed) {\n            console.log('Loading/reloading knowledge base...');\n            \n            const knowledgeText = fs.readFileSync(knowledgeBasePath, 'utf-8');\n            knowledgeBase = await processKnowledgeBase(knowledgeText);\n            lastProcessed = Date.now();\n            \n            console.log(`Knowledge base loaded: ${knowledgeBase.chunks.length} chunks`);\n        }\n        \n    } catch (error) {\n        console.error('Error loading knowledge base:', error);\n        // Continue with empty knowledge base\n        knowledgeBase = {\n            chunks: [],\n            embeddings: [],\n            metadata: {\n                totalChunks: 0,\n                lastProcessed: Date.now(),\n                version: '1.0'\n            }\n        };\n    }\n}\n\n/**\n * Process knowledge base text into chunks and embeddings\n */\nasync function processKnowledgeBase(knowledgeText) {\n    try {\n        // Split text into chunks\n        const chunks = splitIntoChunks(knowledgeText);\n        \n        // Generate embeddings for each chunk\n        const embeddings = [];\n        const processedChunks = [];\n        \n        for (let i = 0; i < chunks.length; i++) {\n            const chunk = chunks[i];\n            if (chunk.trim().length === 0) continue;\n            \n            try {\n                const embedding = await generateEmbedding(chunk);\n                \n                processedChunks.push({\n                    id: generateId(),\n                    text: chunk,\n                    embedding: embedding,\n                    metadata: {\n                        source: 'knowledge_base.txt',\n                        index: i,\n                        lastUpdated: Date.now()\n                    }\n                });\n                \n                embeddings.push(embedding);\n                \n            } catch (error) {\n                console.error(`Error processing chunk ${i}:`, error);\n                continue;\n            }\n        }\n        \n        return {\n            chunks: processedChunks,\n            embeddings: embeddings,\n            metadata: {\n                totalChunks: processedChunks.length,\n                lastProcessed: Date.now(),\n                version: '1.0'\n            }\n        };\n        \n    } catch (error) {\n        console.error('Error processing knowledge base:', error);\n        throw error;\n    }\n}\n\n/**\n * Split text into chunks\n */\nfunction splitIntoChunks(text) {\n    // Split by double newlines (paragraph separation)\n    const paragraphs = text.split(/\\n\\s*\\n/).filter(p => p.trim().length > 0);\n    \n    const chunks = [];\n    \n    for (const paragraph of paragraphs) {\n        if (paragraph.length <= CONFIG.chunkSize) {\n            chunks.push(paragraph.trim());\n        } else {\n            // Split long paragraphs into smaller chunks\n            const sentences = paragraph.split(/[.!?]+/).filter(s => s.trim().length > 0);\n            let currentChunk = '';\n            \n            for (const sentence of sentences) {\n                const trimmedSentence = sentence.trim();\n                if (currentChunk.length + trimmedSentence.length + 1 <= CONFIG.chunkSize) {\n                    currentChunk += (currentChunk ? '. ' : '') + trimmedSentence;\n                } else {\n                    if (currentChunk) {\n                        chunks.push(currentChunk + '.');\n                    }\n                    currentChunk = trimmedSentence;\n                }\n            }\n            \n            if (currentChunk) {\n                chunks.push(currentChunk + '.');\n            }\n        }\n    }\n    \n    return chunks;\n}\n\n/**\n * Generate embedding for text\n */\nasync function generateEmbedding(text) {\n    try {\n        const result = await embeddingModel.embedContent(text);\n        return result.embedding.values;\n    } catch (error) {\n        console.error('Error generating embedding:', error);\n        throw error;\n    }\n}\n\n/**\n * Search for similar chunks using cosine similarity\n */\nfunction searchSimilarChunks(queryEmbedding, topK = 5) {\n    if (!knowledgeBase || knowledgeBase.chunks.length === 0) {\n        return [];\n    }\n    \n    const similarities = knowledgeBase.chunks.map(chunk => ({\n        chunk,\n        similarity: cosineSimilarity(queryEmbedding, chunk.embedding),\n        metadata: chunk.metadata\n    }));\n    \n    return similarities\n        .sort((a, b) => b.similarity - a.similarity)\n        .slice(0, topK)\n        .filter(result => result.similarity > 0.1); // Filter out very low similarity\n}\n\n/**\n * Calculate cosine similarity between two vectors\n */\nfunction cosineSimilarity(vectorA, vectorB) {\n    if (!vectorA || !vectorB || vectorA.length !== vectorB.length) {\n        return 0;\n    }\n    \n    let dotProduct = 0;\n    let magnitudeA = 0;\n    let magnitudeB = 0;\n    \n    for (let i = 0; i < vectorA.length; i++) {\n        dotProduct += vectorA[i] * vectorB[i];\n        magnitudeA += vectorA[i] * vectorA[i];\n        magnitudeB += vectorB[i] * vectorB[i];\n    }\n    \n    const magnitude = Math.sqrt(magnitudeA) * Math.sqrt(magnitudeB);\n    return magnitude === 0 ? 0 : dotProduct / magnitude;\n}\n\n/**\n * Generate response using retrieved context\n */\nasync function generateResponse(userQuery, retrievedChunks) {\n    try {\n        const context = retrievedChunks\n            .map(result => `- ${result.chunk.text}`)\n            .join('\\n');\n        \n        let prompt;\n        \n        if (retrievedChunks.length === 0) {\n            // No relevant context found\n            prompt = `You are RagZzy, a helpful customer support assistant. A user asked: \"${userQuery}\"\n\nI don't have specific information about this topic in my knowledge base. Please provide a brief, helpful response that:\n1. Acknowledges that you don't have specific information about their question\n2. Suggests they could help by providing the answer to improve the knowledge base\n3. Offers to help with other questions you might know about\n4. Keeps a friendly, supportive tone\n\nResponse:`;\n        } else {\n            // Use retrieved context\n            prompt = `You are RagZzy, a helpful customer support assistant. Based ONLY on the following information, answer the user's question. If the information isn't fully relevant or doesn't contain a complete answer, acknowledge what you do know and mention that additional details could be helpful.\n\nContext:\n${context}\n\nUser Question: ${userQuery}\n\nProvide a helpful, conversational response based on the context above. If the context doesn't fully answer the question, say so and suggest that the user could help improve the knowledge base.\n\nResponse:`;\n        }\n        \n        const result = await chatModel.generateContent({\n            contents: [{ role: 'user', parts: [{ text: prompt }] }],\n            generationConfig: {\n                maxOutputTokens: CONFIG.maxResponseTokens,\n                temperature: 0.7,\n                topP: 0.8,\n                topK: 40\n            }\n        });\n        \n        const response = result.response;\n        return response.text();\n        \n    } catch (error) {\n        console.error('Error generating response:', error);\n        \n        // Fallback response\n        if (retrievedChunks.length === 0) {\n            return \"I don't have specific information about that topic yet. Would you like to help by sharing what you know? This would help me provide better answers to future users with similar questions.\";\n        } else {\n            return \"I found some related information, but I'm having trouble generating a complete response right now. Please try again, or feel free to contribute additional details to help improve my knowledge base.\";\n        }\n    }\n}\n\n/**\n * Get relevant guided prompts based on user query\n */\nfunction getRelevantGuidedPrompts(query) {\n    const guidedPrompts = [\n        {\n            id: 'business-hours',\n            question: 'What are your business hours?',\n            category: 'business-info',\n            keywords: ['hours', 'open', 'closed', 'time', 'schedule']\n        },\n        {\n            id: 'contact-info',\n            question: 'How can customers contact support?',\n            category: 'business-info',\n            keywords: ['contact', 'phone', 'email', 'support', 'help']\n        },\n        {\n            id: 'main-products',\n            question: 'What are your main products or services?',\n            category: 'products',\n            keywords: ['product', 'service', 'offer', 'sell', 'provide']\n        },\n        {\n            id: 'pricing-info',\n            question: 'What is your pricing structure?',\n            category: 'pricing',\n            keywords: ['price', 'cost', 'fee', 'pricing', 'plan', 'subscription']\n        },\n        {\n            id: 'return-policy',\n            question: 'What is your return/refund policy?',\n            category: 'policies',\n            keywords: ['return', 'refund', 'policy', 'exchange', 'money back']\n        }\n    ];\n    \n    const queryLower = query.toLowerCase();\n    \n    // Find prompts with matching keywords\n    const relevantPrompts = guidedPrompts.filter(prompt => \n        prompt.keywords.some(keyword => queryLower.includes(keyword))\n    );\n    \n    // Return up to 3 most relevant prompts, or all prompts if none match\n    return relevantPrompts.length > 0 ? relevantPrompts.slice(0, 3) : guidedPrompts.slice(0, 3);\n}\n\n/**\n * Check if message is spam or inappropriate\n */\nfunction isSpamOrInappropriate(message) {\n    const spamPatterns = [\n        /buy.{0,10}now/i,\n        /click.{0,10}here/i,\n        /free.{0,10}money/i,\n        /viagra/i,\n        /casino/i,\n        /\\b(\\w)\\1{4,}/g, // Repeated characters\n    ];\n    \n    return spamPatterns.some(pattern => pattern.test(message));\n}\n\n/**\n * Generate a unique request ID\n */\nfunction generateRequestId() {\n    return 'req_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();\n}\n\n/**\n * Generate a unique ID\n */\nfunction generateId() {\n    return Math.random().toString(36).substr(2, 9) + '_' + Date.now();\n}\n\n// Add user contributions to knowledge base\nfunction addUserContribution(question, answer, metadata = {}) {\n    if (!knowledgeBase) {\n        knowledgeBase = {\n            chunks: [],\n            embeddings: [],\n            metadata: {\n                totalChunks: 0,\n                lastProcessed: Date.now(),\n                version: '1.0'\n            }\n        };\n    }\n    \n    const contributionText = `${question}\\n${answer}`;\n    \n    // This would be expanded to actually generate embeddings and add to the knowledge base\n    // For now, we'll log the contribution\n    console.log('User contribution received:', { question, answer, metadata });\n    \n    return {\n        success: true,\n        message: 'Thank you for your contribution!'\n    };\n}\n\n// Export for use in contribution endpoint\nmodule.exports.addUserContribution = addUserContribution;\nmodule.exports.generateEmbedding = generateEmbedding;"
+/**
+ * RagZzy Chat API - Main chat endpoint with RAG functionality
+ * Handles user queries, retrieval-augmented generation, and knowledge contribution prompts
+ */
+
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const fs = require('fs');
+const path = require('path');
+
+// Initialize Gemini AI
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const chatModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-exp' });
+const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
+
+// In-memory knowledge base cache
+let knowledgeBase = null;
+let lastProcessed = 0;
+
+// Configuration
+const CONFIG = {
+    confidenceThreshold: parseFloat(process.env.CONFIDENCE_THRESHOLD) || 0.3,
+    maxRetrievalChunks: 5,
+    chunkSize: 500,
+    chunkOverlap: 50,
+    maxResponseTokens: 1000
+};
+
+/**
+ * Main request handler
+ */
+module.exports = async (req, res) => {
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+    
+    if (req.method !== 'POST') {
+        return res.status(405).json({ 
+            error: 'Method not allowed',
+            code: 'METHOD_NOT_ALLOWED'
+        });
+    }
+    
+    const startTime = Date.now();
+    const requestId = generateRequestId();
+    
+    try {
+        // Validate and parse request
+        const { message, sessionId } = req.body;
+        
+        if (!message || typeof message !== 'string') {
+            return res.status(400).json({
+                error: 'Message is required',
+                code: 'INVALID_INPUT',
+                requestId
+            });
+        }
+        
+        if (message.length > 1000) {
+            return res.status(400).json({
+                error: 'Message too long (max 1000 characters)',
+                code: 'MESSAGE_TOO_LONG',
+                requestId
+            });
+        }
+        
+        if (message.trim().length < 1) {
+            return res.status(400).json({
+                error: 'Message cannot be empty',
+                code: 'EMPTY_MESSAGE',
+                requestId
+            });
+        }
+        
+        // Initialize or update knowledge base
+        await ensureKnowledgeBase();
+        
+        // Process chat request
+        const response = await processChatRequest(message, sessionId, requestId);
+        const processingTime = Date.now() - startTime;
+        
+        // Return response
+        res.status(200).json({
+            ...response,
+            timestamp: Date.now(),
+            processingTime,
+            requestId
+        });
+        
+    } catch (error) {
+        console.error(`[${requestId}] Chat API error:`, error);
+        
+        const processingTime = Date.now() - startTime;
+        
+        // Handle specific error types
+        if (error.message?.includes('API key')) {
+            return res.status(500).json({
+                error: 'Service temporarily unavailable',
+                code: 'SERVICE_ERROR',
+                requestId,
+                processingTime
+            });
+        }
+        
+        if (error.message?.includes('quota') || error.message?.includes('rate limit')) {
+            return res.status(429).json({
+                error: 'Too many requests. Please try again in a moment.',
+                code: 'RATE_LIMITED',
+                requestId,
+                processingTime
+            });
+        }
+        
+        // Generic error response
+        res.status(500).json({
+            error: 'Something went wrong. Please try again.',
+            code: 'INTERNAL_ERROR',
+            requestId,
+            processingTime
+        });
+    }
+};
+
+/**
+ * Process the chat request using RAG
+ */
+async function processChatRequest(message, sessionId, requestId) {
+    try {
+        // Generate embedding for user query
+        const queryEmbedding = await generateEmbedding(message);
+        
+        // Retrieve relevant knowledge chunks
+        const retrievedChunks = searchSimilarChunks(queryEmbedding, CONFIG.maxRetrievalChunks);
+        
+        // Calculate confidence based on best similarity score
+        const confidence = retrievedChunks.length > 0 ? retrievedChunks[0].similarity : 0;
+        
+        // Generate response using retrieved context
+        const response = await generateResponse(message, retrievedChunks);
+        
+        // Determine if we should prompt for contribution
+        const shouldPromptContribution = confidence < CONFIG.confidenceThreshold && 
+                                       message.length > 10 && 
+                                       !isSpamOrInappropriate(message);
+        
+        const result = {
+            response: response,
+            confidence: confidence,
+            sources: retrievedChunks.map(chunk => chunk.metadata?.source || 'knowledge_base').filter(Boolean)
+        };
+        
+        // Add contribution prompt if needed
+        if (shouldPromptContribution) {
+            result.contributionPrompt = {
+                show: true,
+                message: "I don't have enough information to fully answer that question. Would you like to help by providing the answer?",
+                suggestedPrompts: getRelevantGuidedPrompts(message)
+            };
+        } else {
+            result.contributionPrompt = {
+                show: false
+            };
+        }
+        
+        return result;
+        
+    } catch (error) {
+        console.error(`[${requestId}] RAG processing error:`, error);
+        throw error;
+    }
+}
+
+/**
+ * Ensure knowledge base is loaded and up-to-date
+ */
+async function ensureKnowledgeBase() {
+    try {
+        const knowledgeBasePath = path.join(process.cwd(), 'knowledge_base.txt');
+        
+        // Check if file exists
+        if (!fs.existsSync(knowledgeBasePath)) {
+            console.warn('Knowledge base file not found, creating empty knowledge base');
+            knowledgeBase = {
+                chunks: [],
+                embeddings: [],
+                metadata: {
+                    totalChunks: 0,
+                    lastProcessed: Date.now(),
+                    version: '1.0'
+                }
+            };
+            return;
+        }
+        
+        const stats = fs.statSync(knowledgeBasePath);
+        const fileModified = stats.mtime.getTime();
+        
+        // Check if we need to reload
+        if (!knowledgeBase || fileModified > lastProcessed) {
+            console.log('Loading/reloading knowledge base...');
+            
+            const knowledgeText = fs.readFileSync(knowledgeBasePath, 'utf-8');
+            knowledgeBase = await processKnowledgeBase(knowledgeText);
+            lastProcessed = Date.now();
+            
+            console.log(`Knowledge base loaded: ${knowledgeBase.chunks.length} chunks`);
+        }
+        
+    } catch (error) {
+        console.error('Error loading knowledge base:', error);
+        // Continue with empty knowledge base
+        knowledgeBase = {
+            chunks: [],
+            embeddings: [],
+            metadata: {
+                totalChunks: 0,
+                lastProcessed: Date.now(),
+                version: '1.0'
+            }
+        };
+    }
+}
+
+/**
+ * Process knowledge base text into chunks and embeddings
+ */
+async function processKnowledgeBase(knowledgeText) {
+    try {
+        // Split text into chunks
+        const chunks = splitIntoChunks(knowledgeText);
+        
+        // Generate embeddings for each chunk
+        const embeddings = [];
+        const processedChunks = [];
+        
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            if (chunk.trim().length === 0) continue;
+            
+            try {
+                const embedding = await generateEmbedding(chunk);
+                
+                processedChunks.push({
+                    id: generateId(),
+                    text: chunk,
+                    embedding: embedding,
+                    metadata: {
+                        source: 'knowledge_base.txt',
+                        index: i,
+                        lastUpdated: Date.now()
+                    }
+                });
+                
+                embeddings.push(embedding);
+                
+            } catch (error) {
+                console.error(`Error processing chunk ${i}:`, error);
+                continue;
+            }
+        }
+        
+        return {
+            chunks: processedChunks,
+            embeddings: embeddings,
+            metadata: {
+                totalChunks: processedChunks.length,
+                lastProcessed: Date.now(),
+                version: '1.0'
+            }
+        };
+        
+    } catch (error) {
+        console.error('Error processing knowledge base:', error);
+        throw error;
+    }
+}
+
+/**
+ * Split text into chunks
+ */
+function splitIntoChunks(text) {
+    // Split by double newlines (paragraph separation)
+    const paragraphs = text.split(/\\n\\n/)
+\\s*\
+/).filter(p => p.trim().length > 0);
+    
+    const chunks = [];
+    
+    for (const paragraph of paragraphs) {
+        if (paragraph.length <= CONFIG.chunkSize) {
+            chunks.push(paragraph.trim());
+        } else {
+            // Split long paragraphs into smaller chunks
+            const sentences = paragraph.split(/[.!?]+/).filter(s => s.trim().length > 0);
+            let currentChunk = '';
+            
+            for (const sentence of sentences) {
+                const trimmedSentence = sentence.trim();
+                if (currentChunk.length + trimmedSentence.length + 1 <= CONFIG.chunkSize) {
+                    currentChunk += (currentChunk ? '. ' : '') + trimmedSentence;
+                } else {
+                    if (currentChunk) {
+                        chunks.push(currentChunk + '.');
+                    }
+                    currentChunk = trimmedSentence;
+                }
+            }
+            
+            if (currentChunk) {
+                chunks.push(currentChunk + '.');
+            }
+        }
+    }
+    
+    return chunks;
+}
+
+/**
+ * Generate embedding for text
+ */
+async function generateEmbedding(text) {
+    try {
+        const result = await embeddingModel.embedContent(text);
+        return result.embedding.values;
+    } catch (error) {
+        console.error('Error generating embedding:', error);
+        throw error;
+    }
+}
+
+/**
+ * Search for similar chunks using cosine similarity
+ */
+function searchSimilarChunks(queryEmbedding, topK = 5) {
+    if (!knowledgeBase || knowledgeBase.chunks.length === 0) {
+        return [];
+    }
+    
+    const similarities = knowledgeBase.chunks.map(chunk => ({
+        chunk,
+        similarity: cosineSimilarity(queryEmbedding, chunk.embedding),
+        metadata: chunk.metadata
+    }));
+    
+    return similarities
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, topK)
+        .filter(result => result.similarity > 0.1); // Filter out very low similarity
+}
+
+/**
+ * Calculate cosine similarity between two vectors
+ */
+function cosineSimilarity(vectorA, vectorB) {
+    if (!vectorA || !vectorB || vectorA.length !== vectorB.length) {
+        return 0;
+    }
+    
+    let dotProduct = 0;
+    let magnitudeA = 0;
+    let magnitudeB = 0;
+    
+    for (let i = 0; i < vectorA.length; i++) {
+        dotProduct += vectorA[i] * vectorB[i];
+        magnitudeA += vectorA[i] * vectorA[i];
+        magnitudeB += vectorB[i] * vectorB[i];
+    }
+    
+    const magnitude = Math.sqrt(magnitudeA) * Math.sqrt(magnitudeB);
+    return magnitude === 0 ? 0 : dotProduct / magnitude;
+}
+
+/**
+ * Generate response using retrieved context
+ */
+async function generateResponse(userQuery, retrievedChunks) {
+    try {
+        const context = retrievedChunks
+            .map(result => `- ${result.chunk.text}`)
+            .join('\
+');
+        
+        let prompt;
+        
+        if (retrievedChunks.length === 0) {
+            // No relevant context found
+            prompt = `You are RagZzy, a helpful customer support assistant. A user asked: '${userQuery}'
+
+I don't have specific information about this topic in my knowledge base. Please provide a brief, helpful response that:
+1. Acknowledges that you don't have specific information about their question
+2. Suggests they could help by providing the answer to improve the knowledge base
+3. Offers to help with other questions you might know about
+4. Keeps a friendly, supportive tone
+
+Response:`;
+        } else {
+            // Use retrieved context
+            prompt = `You are RagZzy, a helpful customer support assistant. Based ONLY on the following information, answer the user's question. If the information isn't fully relevant or doesn't contain a complete answer, acknowledge what you do know and mention that additional details could be helpful.
+
+Context:
+${context}
+
+User Question: ${userQuery}
+
+Provide a helpful, conversational response based on the context above. If the context doesn't fully answer the question, say so and suggest that the user could help improve the knowledge base.
+
+Response:`;
+        }
+        
+        const result = await chatModel.generateContent({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: {
+                maxOutputTokens: CONFIG.maxResponseTokens,
+                temperature: 0.7,
+                topP: 0.8,
+                topK: 40
+            }
+        });
+        
+        const response = result.response;
+        return response.text();
+        
+    } catch (error) {
+        console.error('Error generating response:', error);
+        
+        // Fallback response
+        if (retrievedChunks.length === 0) {
+            return 'I don't have specific information about that topic yet. Would you like to help by sharing what you know? This would help me provide better answers to future users with similar questions.';
+        } else {
+            return 'I found some related information, but I'm having trouble generating a complete response right now. Please try again, or feel free to contribute additional details to help improve my knowledge base.';
+        }
+    }
+}
+
+/**
+ * Get relevant guided prompts based on user query
+ */
+function getRelevantGuidedPrompts(query) {
+    const guidedPrompts = [
+        {
+            id: 'business-hours',
+            question: 'What are your business hours?',
+            category: 'business-info',
+            keywords: ['hours', 'open', 'closed', 'time', 'schedule']
+        },
+        {
+            id: 'contact-info',
+            question: 'How can customers contact support?',
+            category: 'business-info',
+            keywords: ['contact', 'phone', 'email', 'support', 'help']
+        },
+        {
+            id: 'main-products',
+            question: 'What are your main products or services?',
+            category: 'products',
+            keywords: ['product', 'service', 'offer', 'sell', 'provide']
+        },
+        {
+            id: 'pricing-info',
+            question: 'What is your pricing structure?',
+            category: 'pricing',
+            keywords: ['price', 'cost', 'fee', 'pricing', 'plan', 'subscription']
+        },
+        {
+            id: 'return-policy',
+            question: 'What is your return/refund policy?',
+            category: 'policies',
+            keywords: ['return', 'refund', 'policy', 'exchange', 'money back']
+        }
+    ];
+    
+    const queryLower = query.toLowerCase();
+    
+    // Find prompts with matching keywords
+    const relevantPrompts = guidedPrompts.filter(prompt => 
+        prompt.keywords.some(keyword => queryLower.includes(keyword))
+    );
+    
+    // Return up to 3 most relevant prompts, or all prompts if none match
+    return relevantPrompts.length > 0 ? relevantPrompts.slice(0, 3) : guidedPrompts.slice(0, 3);
+}
+
+/**
+ * Check if message is spam or inappropriate
+ */
+function isSpamOrInappropriate(message) {
+    const spamPatterns = [
+        /buy.{0,10}now/i,
+        /click.{0,10}here/i,
+        /free.{0,10}money/i,
+        /viagra/i,
+        /casino/i,
+        /\\b(\\w)\\1{4,}/g, // Repeated characters
+    ];
+    
+    return spamPatterns.some(pattern => pattern.test(message));
+}
+
+/**
+ * Generate a unique request ID
+ */
+function generateRequestId() {
+    return 'req_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+}
+
+/**
+ * Generate a unique ID
+ */
+function generateId() {
+    return Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+}
+
+// Add user contributions to knowledge base
+function addUserContribution(question, answer, metadata = {}) {
+    if (!knowledgeBase) {
+        knowledgeBase = {
+            chunks: [],
+            embeddings: [],
+            metadata: {
+                totalChunks: 0,
+                lastProcessed: Date.now(),
+                version: '1.0'
+            }
+        };
+    }
+    
+    const contributionText = `${question}\
+${answer}`;
+    
+    // This would be expanded to actually generate embeddings and add to the knowledge base
+    // For now, we'll log the contribution
+    console.log('User contribution received:', { question, answer, metadata });
+    
+    return {
+        success: true,
+        message: 'Thank you for your contribution!'
+    };
+}
+
+// Export for use in contribution endpoint
+module.exports.addUserContribution = addUserContribution;
+module.exports.generateEmbedding = generateEmbedding;"

@@ -1,1 +1,56 @@
-/**\n * Health Check API - Simple endpoint to check service status\n */\n\nmodule.exports = async (req, res) => {\n    // Set CORS headers\n    res.setHeader('Access-Control-Allow-Origin', '*');\n    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');\n    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');\n    \n    if (req.method === 'OPTIONS') {\n        return res.status(200).end();\n    }\n    \n    if (req.method !== 'GET') {\n        return res.status(405).json({ \n            error: 'Method not allowed',\n            code: 'METHOD_NOT_ALLOWED'\n        });\n    }\n    \n    try {\n        const healthStatus = {\n            status: 'healthy',\n            timestamp: new Date().toISOString(),\n            service: 'RagZzy Chat API',\n            version: '1.0.0',\n            uptime: process.uptime(),\n            environment: process.env.NODE_ENV || 'development',\n            features: {\n                chat: true,\n                knowledgeContribution: true,\n                ragRetrieval: true\n            }\n        };\n        \n        // Check if Gemini API key is configured\n        if (!process.env.GEMINI_API_KEY) {\n            healthStatus.status = 'degraded';\n            healthStatus.warnings = ['Gemini API key not configured'];\n        }\n        \n        const statusCode = healthStatus.status === 'healthy' ? 200 : 503;\n        res.status(statusCode).json(healthStatus);\n        \n    } catch (error) {\n        console.error('Health check error:', error);\n        \n        res.status(503).json({\n            status: 'unhealthy',\n            timestamp: new Date().toISOString(),\n            service: 'RagZzy Chat API',\n            error: 'Service experiencing issues'\n        });\n    }\n};"
+/**
+ * Health Check API - Simple endpoint to check service status
+ */
+
+module.exports = async (req, res) => {
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+    
+    if (req.method !== 'GET') {
+        return res.status(405).json({ 
+            error: 'Method not allowed',
+            code: 'METHOD_NOT_ALLOWED'
+        });
+    }
+    
+    try {
+        const healthStatus = {
+            status: 'healthy',
+            timestamp: new Date().toISOString(),
+            service: 'RagZzy Chat API',
+            version: '1.0.0',
+            uptime: process.uptime(),
+            environment: process.env.NODE_ENV || 'development',
+            features: {
+                chat: true,
+                knowledgeContribution: true,
+                ragRetrieval: true
+            }
+        };
+        
+        // Check if Gemini API key is configured
+        if (!process.env.GEMINI_API_KEY) {
+            healthStatus.status = 'degraded';
+            healthStatus.warnings = ['Gemini API key not configured'];
+        }
+        
+        const statusCode = healthStatus.status === 'healthy' ? 200 : 503;
+        res.status(statusCode).json(healthStatus);
+        
+    } catch (error) {
+        console.error('Health check error:', error);
+        
+        res.status(503).json({
+            status: 'unhealthy',
+            timestamp: new Date().toISOString(),
+            service: 'RagZzy Chat API',
+            error: 'Service experiencing issues'
+        });
+    }
+};
