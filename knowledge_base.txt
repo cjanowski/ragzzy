@@ -1,0 +1,35 @@
+Welcome to RagZzy Support
+We're here to help you with your questions!
+
+What are your business hours?
+Our customer support is available Monday through Friday, 9 AM to 5 PM Eastern Time. For urgent issues outside business hours, please email us and we'll respond within 24 hours.
+
+How can I contact support?
+You can reach us through several channels:
+- Email: support@ragzzy.com
+- Phone: (555) 123-4567 (business hours only)
+- This chat interface for immediate assistance
+- Help center at help.ragzzy.com
+
+What is RagZzy?
+RagZzy is an intelligent customer support chatbot powered by advanced AI technology. It learns from your knowledge base and gets smarter over time through user contributions.
+
+How does the knowledge building feature work?
+When RagZzy doesn't know the answer to a question, it will ask you to help by providing the information. Your contributions are immediately added to the knowledge base and help future users get better answers.
+
+What types of questions can RagZzy answer?
+RagZzy can help with:
+- General business information
+- Product and service details
+- Support processes and how-to guides
+- Company policies and procedures
+- Any information that has been added to the knowledge base
+
+Is my conversation data stored?
+No, your conversations are not stored permanently. We only keep temporary session data to maintain context during your current chat session. All conversation data is cleared when you close the chat.
+
+How accurate are RagZzy's responses?
+RagZzy provides responses based on the information in its knowledge base. Response accuracy depends on the quality and completeness of the knowledge base content. When confidence is low, RagZzy will ask for your help to improve its knowledge.
+
+Can I contribute my own knowledge?
+Yes! RagZzy encourages user contributions to help build a comprehensive knowledge base. When you provide helpful information, it becomes immediately available to help other users with similar questions.

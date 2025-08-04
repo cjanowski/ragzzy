@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RagZzy - Intelligent Customer Support</title>
+    <meta name="description" content="Get instant help with RagZzy, an AI-powered customer support chatbot that learns from your contributions.">
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="chat-header">
+            <div class="header-content">
+                <div class="logo-section">
+                    <div class="logo">🤖</div>
+                    <div class="header-text">
+                        <h1>RagZzy Support</h1>
+                        <p class="header-subtitle">AI-powered help that gets smarter with your input</p>
+                    </div>
+                </div>
+                <div class="status-indicator">
+                    <div class="status-dot online" id="statusDot"></div>
+                    <span class="status-text" id="statusText">Online</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Chat Container -->
+        <main class="chat-container">
+            <!-- Messages Area -->
+            <div class="messages-container" id="messagesContainer" role="log" aria-live="polite" aria-label="Chat messages">
+                <!-- Welcome Message -->
+                <div class="message bot-message welcome-message">
+                    <div class="message-avatar">
+                        <div class="avatar bot-avatar">🤖</div>
+                    </div>
+                    <div class="message-content">
+                        <div class="message-text">
+                            <p>Hello! I'm RagZzy, your AI support assistant. I'm here to help answer your questions.</p>
+                            <p>💡 <strong>Help me learn:</strong> If I don't know something, you can teach me by providing the answer. This helps me assist future users better!</p>
+                        </div>
+                        <div class="message-time" id="welcomeTime"></div>
+                    </div>
+                </div>
+
+                <!-- Knowledge Building Prompt (Initially Hidden) -->
+                <div class="knowledge-prompt" id="knowledgePrompt" style="display: none;">
+                    <div class="prompt-header">
+                        <h3>🌟 Help Build the Knowledge Base</h3>
+                        <p>Answer these questions to help other users get better support:</p>
+                    </div>
+                    <div class="guided-prompts" id="guidedPrompts">
+                        <!-- Guided prompts will be dynamically inserted here -->
+                    </div>
+                    <div class="prompt-actions">
+                        <button class="btn btn-secondary" id="skipPrompts">Skip for now</button>
+                        <button class="btn btn-primary" id="startContributing">Start Contributing</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Contribution Modal -->
+            <div class="modal-overlay" id="contributionModal" style="display: none;">
+                <div class="modal-content" role="dialog" aria-labelledby="contributionTitle" aria-modal="true">
+                    <div class="modal-header">
+                        <h2 id="contributionTitle">Share Your Knowledge</h2>
+                        <button class="modal-close" id="closeContribution" aria-label="Close contribution modal">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <form id="contributionForm">
+                            <div class="form-group">
+                                <label for="contributionQuestion">Question:</label>
+                                <input type="text" id="contributionQuestion" name="question" placeholder="What question are you answering?" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="contributionAnswer">Answer:</label>
+                                <textarea id="contributionAnswer" name="answer" placeholder="Please provide a helpful answer..." required rows="4"></textarea>
+                                <div class="char-counter">
+                                    <span id="charCount">0</span> / 2000 characters
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="contributionCategory">Category (optional):</label>
+                                <select id="contributionCategory" name="category">
+                                    <option value="">Select a category</option>
+                                    <option value="business-info">Business Information</option>
+                                    <option value="products">Products & Services</option>
+                                    <option value="pricing">Pricing</option>
+                                    <option value="policies">Policies</option>
+                                    <option value="support">Support & How-to</option>
+                                    <option value="other">Other</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="contributionConfidence">How confident are you in this answer?</label>
+                                <div class="confidence-slider">
+                                    <input type="range" id="contributionConfidence" name="confidence" min="1" max="5" value="4">
+                                    <div class="confidence-labels">
+                                        <span>Not sure</span>
+                                        <span>Very confident</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" id="cancelContribution">Cancel</button>
+                        <button type="submit" form="contributionForm" class="btn btn-primary" id="submitContribution">
+                            <span class="btn-text">Add Knowledge</span>
+                            <span class="btn-loading" style="display: none;">Adding...</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Typing Indicator -->
+            <div class="typing-indicator" id="typingIndicator" style="display: none;">
+                <div class="message-avatar">
+                    <div class="avatar bot-avatar">🤖</div>
+                </div>
+                <div class="typing-content">
+                    <div class="typing-dots">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                    </div>
+                    <div class="typing-text">RagZzy is thinking...</div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Input Area -->
+        <footer class="input-container">
+            <form class="input-form" id="messageForm">
+                <div class="input-wrapper">
+                    <textarea 
+                        id="messageInput" 
+                        placeholder="Ask me anything... I'm here to help!" 
+                        rows="1"
+                        maxlength="1000"
+                        aria-label="Type your message"
+                        required
+                    ></textarea>
+                    <button 
+                        type="submit" 
+                        class="send-button" 
+                        id="sendButton"
+                        aria-label="Send message"
+                        disabled
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M2 21L23 12L2 3V10L17 12L2 14V21Z" fill="currentColor"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="input-footer">
+                    <div class="input-hints">
+                        <span class="hint" id="charCounter">0/1000</span>
+                        <span class="hint">Press Enter to send, Shift+Enter for new line</span>
+                    </div>
+                </div>
+            </form>
+        </footer>
+    </div>
+
+    <!-- Error Toast -->
+    <div class="toast error-toast" id="errorToast" style="display: none;" role="alert" aria-live="assertive">
+        <div class="toast-content">
+            <span class="toast-icon">⚠️</span>
+            <span class="toast-message" id="errorMessage"></span>
+        </div>
+        <button class="toast-close" id="closeError" aria-label="Close error message">&times;</button>
+    </div>
+
+    <!-- Success Toast -->
+    <div class="toast success-toast" id="successToast" style="display: none;" role="alert" aria-live="polite">
+        <div class="toast-content">
+            <span class="toast-icon">✅</span>
+            <span class="toast-message" id="successMessage"></span>
+        </div>
+        <button class="toast-close" id="closeSuccess" aria-label="Close success message">&times;</button>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

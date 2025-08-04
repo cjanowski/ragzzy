@@ -1,0 +1,22 @@
+{
+  "name": "ragzzy",
+  "version": "1.0.0",
+  "description": "RAG-powered customer support chatbot that learns from user contributions",
+  "main": "api/chat.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo \"Static files - no build needed\"",
+    "deploy": "vercel --prod",
+    "test": "echo \"No tests specified yet\" && exit 0",
+    "lint": "echo \"No linting configured yet\"",
+    "start": "vercel dev"
+  },
+  "keywords": ["chatbot", "rag", "ai", "customer-support", "gemini", "knowledge-base"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "dotenv": "^17.2.1"
+  }
+}
