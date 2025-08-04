@@ -557,4 +557,4 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // Make app globally available for onclick handlers
-window.ragzzyApp = ragzzyApp;"
+window.ragzzyApp = ragzzyApp;
