@@ -438,7 +438,7 @@ class RagzzyChatApp {
         suggestionDiv.className = 'knowledge-prompt';
         
         let promptsHtml = prompts.map(prompt => 
-            `<div class=\"guided-prompt-item\" onclick=\"ragzzyApp.showContributionModal('${prompt.question.replace(/'/g, \"\\'\")}')\">                ${prompt.question}            </div>`
+            `<div class="guided-prompt-item" onclick="ragzzyApp.showContributionModal(\`${prompt.question.replace(/'/g, "\\'")}\`)">                ${prompt.question}            </div>`
         ).join('');
         
         suggestionDiv.innerHTML = `
