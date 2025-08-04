@@ -2,7 +2,7 @@
 
 RagZzy is a modern, retrieval‑augmented support assistant that blends semantic + keyword retrieval, dynamic few‑shot prompting, and a post‑generation validator with an optional single‑revision loop. It’s built to demonstrate strong product thinking, pragmatic engineering, and measurable quality.
 
-VIST HERE: [RagZzy](https://ragzzy.vercel.app/)
+VISIT HERE: [RagZzy](https://ragzzy.vercel.app/)
 
 ## Why This Is Interesting
 
