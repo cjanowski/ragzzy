@@ -284,9 +284,7 @@ async function processKnowledgeBase(knowledgeText) {
  */
 function splitIntoChunks(text) {
     // Split by double newlines (paragraph separation)
-    const paragraphs = text.split(/\\n\\n/)
-\\s*\
-/).filter(p => p.trim().length > 0);
+    const paragraphs = text.split(/\\n\\n/).filter(p => p.trim().length > 0);
     
     const chunks = [];
     
@@ -429,9 +427,9 @@ Response:`;
         
         // Fallback response
         if (retrievedChunks.length === 0) {
-            return 'I don't have specific information about that topic yet. Would you like to help by sharing what you know? This would help me provide better answers to future users with similar questions.';
+            return "I don't have specific information about that topic yet. Would you like to help by sharing what you know? This would help me provide better answers to future users with similar questions.";
         } else {
-            return 'I found some related information, but I'm having trouble generating a complete response right now. Please try again, or feel free to contribute additional details to help improve my knowledge base.';
+            return "I found some related information, but I'm having trouble generating a complete response right now. Please try again, or feel free to contribute additional details to help improve my knowledge base.";
         }
     }
 }
