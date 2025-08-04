@@ -499,7 +499,7 @@ class RagzzyChatApp {
     
     showKnowledgePrompt() {
         const guidedPromptsHtml = this.guidedPrompts.map(prompt => 
-            `<div class=\"guided-prompt-item ${prompt.required ? 'required' : ''}\" onclick=\"ragzzyApp.showContributionModal('${prompt.question.replace(/'/g, \"\\'\")}')\">                ${prompt.question}            </div>`
+            `<div class="guided-prompt-item ${prompt.required ? 'required' : ''}" onclick="ragzzyApp.showContributionModal(\`${prompt.question.replace(/'/g, "\\'")}\`)">                ${prompt.question}            </div>`
         ).join('');
         
         document.getElementById('guidedPrompts').innerHTML = guidedPromptsHtml;
