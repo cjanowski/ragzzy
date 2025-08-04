@@ -48,8 +48,16 @@ class RagzzyContributionsApp {
             closeSuccess: document.getElementById('closeSuccess')
         };
         
-        this.init();
-        this.initVisualEffects();
+        // Password gate
+        this.passwordKey = 'ragzzy_contrib_password';
+        this.password = this.getStoredPassword();
+
+        if (this.hasAccess()) {
+            this.init();
+            this.initVisualEffects();
+        } else {
+            this.showPasswordGate();
+        }
     }
     
     init() {
@@ -117,6 +125,92 @@ class RagzzyContributionsApp {
         });
     }
     
+    getStoredPassword() {
+        try {
+            return localStorage.getItem(this.passwordKey) || sessionStorage.getItem(this.passwordKey) || '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    hasAccess() {
+        // If server requires a password, we store and send it via header.
+        // Client-side gate simply checks that some password exists.
+        return !!this.password;
+    }
+
+    showPasswordGate() {
+        // Create a simple inline modal if HTML doesn't include one
+        let gate = document.getElementById('contribPasswordGate');
+        if (!gate) {
+            gate = document.createElement('div');
+            gate.id = 'contribPasswordGate';
+            gate.style.position = 'fixed';
+            gate.style.inset = '0';
+            gate.style.background = 'rgba(0,0,0,0.8)';
+            gate.style.display = 'flex';
+            gate.style.alignItems = 'center';
+            gate.style.justifyContent = 'center';
+            gate.style.zIndex = '9999';
+            gate.innerHTML = `
+                <div style="background:#111827; padding:24px; border-radius:12px; width:90%; max-width:420px; color:#fff; border:1px solid #374151;">
+                    <h3 style="margin:0 0 12px 0; font-size:18px;">Enter Contributions Password</h3>
+                    <p style="margin:0 0 16px 0; color:#9CA3AF; font-size:14px;">Access to the contributions page is restricted.</p>
+                    <div style="display:flex; flex-direction:column; gap:12px;">
+                        <input id="contribPasswordInput" type="password" placeholder="Password" style="padding:10px 12px; border-radius:8px; border:1px solid #374151; background:#0B1220; color:#fff; outline:none;">
+                        <label style="display:flex; align-items:center; gap:8px; font-size:13px; color:#9CA3AF;">
+                            <input id="contribRemember" type="checkbox"> Remember on this device
+                        </label>
+                        <div style="display:flex; gap:8px; justify-content:flex-end;">
+                            <button id="contribCancel" style="padding:8px 12px; background:#374151; color:#fff; border:none; border-radius:8px; cursor:pointer;">Cancel</button>
+                            <button id="contribSubmit" style="padding:8px 12px; background:#6366F1; color:#fff; border:none; border-radius:8px; cursor:pointer;">Unlock</button>
+                        </div>
+                        <div id="contribError" style="color:#ef4444; font-size:13px; display:none;">Invalid password. Try again.</div>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(gate);
+        } else {
+            gate.style.display = 'flex';
+        }
+
+        const input = document.getElementById('contribPasswordInput');
+        const remember = document.getElementById('contribRemember');
+        const btn = document.getElementById('contribSubmit');
+        const cancel = document.getElementById('contribCancel');
+        const err = document.getElementById('contribError');
+
+        const submit = () => {
+            const pw = input.value.trim();
+            if (!pw) {
+                err.textContent = 'Password required';
+                err.style.display = 'block';
+                return;
+            }
+            // Store and init
+            try {
+                if (remember.checked) {
+                    localStorage.setItem(this.passwordKey, pw);
+                } else {
+                    sessionStorage.setItem(this.passwordKey, pw);
+                }
+                this.password = pw;
+            } catch (_) {}
+            gate.style.display = 'none';
+            this.init();
+            this.initVisualEffects();
+        };
+
+        btn.addEventListener('click', submit);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') submit();
+        });
+        cancel.addEventListener('click', () => {
+            // navigate away to home
+            window.location.href = 'index.html';
+        });
+    }
+
     async checkOnlineStatus() {
         try {
             const response = await fetch('/api/health', { method: 'GET' });
@@ -401,14 +495,31 @@ class RagzzyContributionsApp {
         }
         
         try {
-            const response = await fetch('/api/contribute', {
-                method: 'POST',
-                headers: {
+            const doPost = async () => {
+                const headers = {
                     'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(contribution)
-            });
-            
+                };
+                if (this.password) {
+                    headers['X-Contrib-Auth'] = this.password;
+                }
+                const resp = await fetch('/api/contribute', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(contribution)
+                });
+                return resp;
+            };
+
+            let response = await doPost();
+
+            // Handle unauthorized: prompt for password and retry once
+            if (response.status === 401) {
+                this.showPasswordGate();
+                // Wait a tick for user interaction is out of scope; instead, show error and return.
+                this.showError('Unauthorized. Please enter the contributions password.');
+                return;
+            }
+
             const result = await response.json();
             
             if (result.success) {
@@ -452,11 +563,12 @@ class RagzzyContributionsApp {
     
     async voteHelpful(contributionId) {
         try {
+            const headers = { 'Content-Type': 'application/json' };
+            if (this.password) headers['X-Contrib-Auth'] = this.password;
+
             const response = await fetch(`/api/contribute/${contributionId}/vote`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers,
                 body: JSON.stringify({ vote: 'helpful' })
             });
             
@@ -475,11 +587,12 @@ class RagzzyContributionsApp {
     async reportContribution(contributionId) {
         if (confirm('Are you sure you want to report this contribution? This will flag it for review.')) {
             try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (this.password) headers['X-Contrib-Auth'] = this.password;
+
                 const response = await fetch(`/api/contribute/${contributionId}/report`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    }
+                    headers
                 });
                 
                 if (response.ok) {

@@ -20,27 +20,80 @@ const CONFIG = {
 module.exports = async (req, res) => {
     // Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Contrib-Auth');
     
     if (req.method === 'OPTIONS') {
         return res.status(200).end();
     }
-    
-    if (req.method !== 'POST') {
-        return res.status(405).json({ 
-            error: 'Method not allowed',
-            code: 'METHOD_NOT_ALLOWED'
-        });
-    }
-    
+
     const startTime = Date.now();
     const requestId = generateRequestId();
-    
+
+    // Route dispatch for subpaths
+    const url = req.url || '';
+    const isBase = url.endsWith('/api/contribute') || url.endsWith('/api/contribute.js') || url === '/api/contribute';
+    const isStats = url.includes('/api/contribute/stats');
+    const isPrompts = url.includes('/api/contribute/prompts');
+    const isRecent = url.includes('/api/contribute/recent');
+    const voteMatch = url.match(/\/api\/contribute\/([^/]+)\/vote/);
+    const reportMatch = url.match(/\/api\/contribute\/([^/]+)\/report/);
+
     try {
+        // Public GET endpoints
+        if (req.method === 'GET') {
+            if (isStats) {
+                return res.status(200).json({ total: 0, yours: 0, helpful: 0 });
+            }
+            if (isPrompts) {
+                // Return a few defaults aligned with frontend
+                return res.status(200).json({
+                    prompts: [
+                        { question: 'What are your business hours?', category: 'business-info' },
+                        { question: 'How can customers contact support?', category: 'support' },
+                        { question: 'What are your main products or services?', category: 'products' }
+                    ]
+                });
+            }
+            if (isRecent) {
+                return res.status(200).json({ contributions: [] });
+            }
+            if (!isBase) {
+                return res.status(404).json({ error: 'Not found' });
+            }
+            // Base GET not supported
+            return res.status(405).json({ error: 'Method not allowed', code: 'METHOD_NOT_ALLOWED' });
+        }
+
+        // Protected POST endpoints require password if configured
+        const requiredSecret = process.env.CONTRIBUTIONS_PASSWORD;
+        if (['POST'].includes(req.method) && (isBase || voteMatch || reportMatch)) {
+            if (requiredSecret) {
+                const provided = req.headers['x-contrib-auth'];
+                if (!provided || provided !== requiredSecret) {
+                    return res.status(401).json({ success: false, message: 'Unauthorized', code: 'UNAUTHORIZED' });
+                }
+            }
+        }
+
+        // Handle vote/report stubs
+        if (voteMatch && req.method === 'POST') {
+            return res.status(200).json({ success: true });
+        }
+        if (reportMatch && req.method === 'POST') {
+            return res.status(200).json({ success: true });
+        }
+
+        // Create contribution at base path
+        if (!isBase || req.method !== 'POST') {
+            return res.status(405).json({
+                error: 'Method not allowed',
+                code: 'METHOD_NOT_ALLOWED'
+            });
+        }
+
         // Validate and parse request
         const contribution = validateContribution(req.body);
-        
         if (!contribution.valid) {
             return res.status(400).json({
                 success: false,
@@ -49,19 +102,18 @@ module.exports = async (req, res) => {
                 requestId
             });
         }
-        
+
         // Process the contribution
         const result = await processContribution(contribution.data, requestId);
         const processingTime = Date.now() - startTime;
-        
+
         // Return success response
-        res.status(200).json({
+        return res.status(200).json({
             ...result,
             timestamp: Date.now(),
             processingTime,
             requestId
         });
-        
     } catch (error) {
         console.error(`[${requestId}] Contribution API error:`, error);
         
@@ -89,7 +141,7 @@ module.exports = async (req, res) => {
         }
         
         // Generic error response
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             message: 'Something went wrong while processing your contribution. Please try again.',
             code: 'INTERNAL_ERROR',
@@ -233,21 +285,31 @@ async function processContribution(contribution, requestId) {
  */
 async function saveToKnowledgeBase(contribution, requestId) {
     try {
-        const knowledgeBasePath = path.join(process.cwd(), 'knowledge_base.txt');
+        const tempPath = path.join('/tmp', 'knowledge_base.txt');
+        const devPath = path.join(process.cwd(), 'knowledge_base.txt');
         
         // Format the contribution
         const timestamp = new Date().toISOString();
-        const formattedContribution = `\
-\
-${contribution.question}\
-${contribution.answer}\
-\
+        const formattedContribution = `
+
+${contribution.question}
+${contribution.answer}
+
 # User contribution - ${timestamp} - Category: ${contribution.category} - Confidence: ${contribution.confidence}/5`;
         
-        // Append to knowledge base file
-        await fs.promises.appendFile(knowledgeBasePath, formattedContribution, 'utf8');
+        // Primary write: /tmp (writable on Vercel)
+        await fs.promises.appendFile(tempPath, formattedContribution, 'utf8');
         
-        console.log(`[${requestId}] Contribution saved to knowledge base`);
+        // Mirror write for local dev convenience only
+        if ((process.env.NODE_ENV || 'development') !== 'production') {
+            try {
+                await fs.promises.appendFile(devPath, formattedContribution, 'utf8');
+            } catch (mirrorErr) {
+                console.warn(`[${requestId}] Dev mirror write failed: ${mirrorErr?.message || mirrorErr}`);
+            }
+        }
+        
+        console.log(`[${requestId}] Contribution saved to knowledge base (/tmp)`);
         
     } catch (error) {
         console.error(`[${requestId}] Error saving to knowledge base:`, error);
