@@ -16,13 +16,30 @@ const embeddingModel = genAI.getGenerativeModel({ model: 'text-embedding-004' })
 let knowledgeBase = null;
 let lastProcessed = 0;
 
+// In-memory conversation memory and user personalization
+const conversationMemory = new Map(); // sessionId -> conversation data
+const userProfiles = new Map(); // userId -> user preferences and learning data
+const responseQualityTracker = new Map(); // responseId -> quality metrics
+
+// Conversation context storage (in-memory - would use Redis/database in production)
+const conversationContexts = new Map();
+const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+const MAX_CONTEXT_MESSAGES = 10; // Keep last 10 messages per session
+
 // Configuration
 const CONFIG = {
     confidenceThreshold: parseFloat(process.env.CONFIDENCE_THRESHOLD) || 0.3,
     maxRetrievalChunks: 5,
     chunkSize: 500,
     chunkOverlap: 50,
-    maxResponseTokens: 1000
+    maxResponseTokens: 1000,
+    // New context-aware configurations
+    maxCandidateResponses: 3,
+    contextWeight: 0.3,
+    intentConfidenceThreshold: 0.6,
+    queryExpansionEnabled: true,
+    adaptiveChunkRetrieval: true,
+    maxQueryExpansions: 2
 };
 
 /**
@@ -83,12 +100,20 @@ module.exports = async (req, res) => {
         const response = await processChatRequest(message, sessionId, requestId);
         const processingTime = Date.now() - startTime;
         
-        // Return response
+        // Record successful request
+        performanceMonitor.recordRequest(true, processingTime);
+        
+        // Return enhanced response with metrics
         res.status(200).json({
             ...response,
             timestamp: Date.now(),
             processingTime,
-            requestId
+            requestId,
+            systemMetrics: {
+                embeddingCacheHits: embeddingCache.size,
+                activeSessions: conversationContexts.size,
+                averageResponseTime: performanceMonitor.metrics.requests.averageResponseTime
+            }
         });
         
     } catch (error) {
@@ -96,26 +121,16 @@ module.exports = async (req, res) => {
         
         const processingTime = Date.now() - startTime;
         
-        // Handle specific error types
-        if (error.message?.includes('API key')) {
-            return res.status(500).json({
-                error: 'Service temporarily unavailable',
-                code: 'SERVICE_ERROR',
-                requestId,
-                processingTime
-            });
-        }
+        // Enhanced error handling with detailed categorization
+        const errorResponse = categorizeError(error, requestId, processingTime);
         
-        if (error.message?.includes('quota') || error.message?.includes('rate limit')) {
-            return res.status(429).json({
-                error: 'Too many requests. Please try again in a moment.',
-                code: 'RATE_LIMITED',
-                requestId,
-                processingTime
-            });
-        }
+        // Record failed request
+        performanceMonitor.recordRequest(false, processingTime);
+        performanceMonitor.recordError(errorResponse.body.code);
         
-        // Generic error response
+        return res.status(errorResponse.status).json(errorResponse.body);
+        
+        // This should not be reached due to categorizeError, but keeping as fallback
         res.status(500).json({
             error: 'Something went wrong. Please try again.',
             code: 'INTERNAL_ERROR',
@@ -126,31 +141,61 @@ module.exports = async (req, res) => {
 };
 
 /**
- * Process the chat request using RAG
+ * Process the chat request using enhanced context-aware AI
  */
 async function processChatRequest(message, sessionId, requestId) {
     try {
-        // Generate embedding for user query
-        const queryEmbedding = await generateEmbedding(message);
+        // Step 1: Get or create conversation context
+        const conversationContext = getOrCreateConversationContext(sessionId, requestId);
         
-        // Retrieve relevant knowledge chunks
-        const retrievedChunks = searchSimilarChunks(queryEmbedding, CONFIG.maxRetrievalChunks);
+        // Step 2: Advanced query processing
+        const queryAnalysis = await analyzeQuery(message, conversationContext, requestId);
         
-        // Calculate confidence based on best similarity score
-        const confidence = retrievedChunks.length > 0 ? retrievedChunks[0].similarity : 0;
+        // Step 3: Context-aware retrieval with query expansion
+        const retrievalResults = await performContextAwareRetrieval(queryAnalysis, conversationContext, requestId);
         
-        // Generate response using retrieved context
-        const response = await generateResponse(message, retrievedChunks);
+        // Step 4: Generate multiple candidate responses
+        const candidateResponses = await generateCandidateResponses(
+            queryAnalysis, 
+            retrievalResults, 
+            conversationContext, 
+            requestId
+        );
         
-        // Determine if we should prompt for contribution
-        const shouldPromptContribution = confidence < CONFIG.confidenceThreshold && 
+        // Step 5: Select and rank best response
+        const finalResponse = await selectBestResponse(candidateResponses, queryAnalysis, conversationContext);
+        
+        // Step 6: Update conversation context
+        updateConversationContext(conversationContext, message, finalResponse, queryAnalysis);
+        
+        // Step 7: Determine contribution prompt need
+        const shouldPromptContribution = finalResponse.confidence < CONFIG.confidenceThreshold && 
                                        message.length > 10 && 
                                        !isSpamOrInappropriate(message);
         
         const result = {
-            response: response,
-            confidence: confidence,
-            sources: retrievedChunks.map(chunk => chunk.metadata?.source || 'knowledge_base').filter(Boolean)
+            response: finalResponse.text,
+            confidence: finalResponse.confidence,
+            sources: finalResponse.sources,
+            intent: queryAnalysis.intent,
+            processingMetadata: {
+                queryAnalysis: {
+                    intent: queryAnalysis.intent,
+                    intentConfidence: queryAnalysis.intentConfidence,
+                    entities: queryAnalysis.entities,
+                    expandedQueries: queryAnalysis.expandedQueries
+                },
+                retrieval: {
+                    chunksRetrieved: retrievalResults.chunks.length,
+                    bestSimilarity: retrievalResults.bestSimilarity,
+                    contextBoost: retrievalResults.contextBoost
+                },
+                response: {
+                    candidatesGenerated: candidateResponses.length,
+                    selectionReason: finalResponse.selectionReason,
+                    qualityScore: finalResponse.qualityScore
+                }
+            }
         };
         
         // Add contribution prompt if needed
@@ -169,9 +214,119 @@ async function processChatRequest(message, sessionId, requestId) {
         return result;
         
     } catch (error) {
-        console.error(`[${requestId}] RAG processing error:`, error);
+        console.error(`[${requestId}] Enhanced RAG processing error:`, error);
         throw error;
     }
+}
+
+/**
+ * Get or create conversation context for a session
+ */
+function getOrCreateConversationContext(sessionId, requestId) {
+    const now = Date.now();
+    
+    // Clean up expired sessions
+    cleanupExpiredSessions(now);
+    
+    if (!sessionId) {
+        sessionId = generateSessionId();
+    }
+    
+    if (!conversationContexts.has(sessionId)) {
+        conversationContexts.set(sessionId, {
+            sessionId,
+            messages: [],
+            entities: new Map(),
+            topics: [],
+            userPreferences: {},
+            createdAt: now,
+            lastActivity: now,
+            intentHistory: [],
+            successfulResponses: 0,
+            totalResponses: 0
+        });
+        console.log(`[${requestId}] Created new conversation context for session: ${sessionId}`);
+    }
+    
+    const context = conversationContexts.get(sessionId);
+    context.lastActivity = now;
+    
+    return context;
+}
+
+/**
+ * Clean up expired conversation sessions
+ */
+function cleanupExpiredSessions(now) {
+    const expiredSessions = [];
+    
+    for (const [sessionId, context] of conversationContexts.entries()) {
+        if (now - context.lastActivity > SESSION_TIMEOUT) {
+            expiredSessions.push(sessionId);
+        }
+    }
+    
+    expiredSessions.forEach(sessionId => {
+        conversationContexts.delete(sessionId);
+        console.log(`Cleaned up expired session: ${sessionId}`);
+    });
+}
+
+/**
+ * Update conversation context with new message and response
+ */
+function updateConversationContext(context, userMessage, response, queryAnalysis) {
+    // Add message to history
+    context.messages.push({
+        type: 'user',
+        content: userMessage,
+        timestamp: Date.now(),
+        intent: queryAnalysis.intent,
+        entities: queryAnalysis.entities
+    });
+    
+    context.messages.push({
+        type: 'assistant',
+        content: response.text,
+        timestamp: Date.now(),
+        confidence: response.confidence,
+        sources: response.sources
+    });
+    
+    // Keep only last N messages
+    if (context.messages.length > MAX_CONTEXT_MESSAGES * 2) {
+        context.messages = context.messages.slice(-MAX_CONTEXT_MESSAGES * 2);
+    }
+    
+    // Update entities
+    queryAnalysis.entities.forEach(entity => {
+        if (!context.entities.has(entity.type)) {
+            context.entities.set(entity.type, new Set());
+        }
+        context.entities.get(entity.type).add(entity.value);
+    });
+    
+    // Update intent history
+    context.intentHistory.push({
+        intent: queryAnalysis.intent,
+        confidence: queryAnalysis.intentConfidence,
+        timestamp: Date.now()
+    });
+    
+    // Update response statistics
+    context.totalResponses++;
+    if (response.confidence > CONFIG.confidenceThreshold) {
+        context.successfulResponses++;
+    }
+    
+    context.lastActivity = Date.now();
+}
+
+/**
+ * Generate a session ID
+ */
+function generateSessionId() {
+    return 'sess_' + Math.random().toString(36).substr(2, 12) + '_' + Date.now();
 }
 
 /**
@@ -318,36 +473,293 @@ function splitIntoChunks(text) {
 }
 
 /**
- * Generate embedding for text
+ * Generate embedding for text (legacy function - now uses cached version)
  */
 async function generateEmbedding(text) {
-    try {
-        const result = await embeddingModel.embedContent(text);
-        return result.embedding.values;
-    } catch (error) {
-        console.error('Error generating embedding:', error);
-        throw error;
-    }
+    return await generateEmbeddingWithCache(text);
 }
 
 /**
- * Search for similar chunks using cosine similarity
+ * Advanced multi-stage semantic search with hybrid retrieval
  */
-function searchSimilarChunks(queryEmbedding, topK = 5) {
+function searchSimilarChunks(queryEmbedding, topK = 5, query = '', conversationContext = null) {
     if (!knowledgeBase || knowledgeBase.chunks.length === 0) {
         return [];
     }
     
-    const similarities = knowledgeBase.chunks.map(chunk => ({
-        chunk,
-        similarity: cosineSimilarity(queryEmbedding, chunk.embedding),
-        metadata: chunk.metadata
-    }));
+    // Stage 1: Semantic similarity search
+    const semanticResults = performSemanticSearch(queryEmbedding, topK * 3);
     
-    return similarities
+    // Stage 2: Keyword-based search for exact matches
+    const keywordResults = performKeywordSearch(query, topK * 2);
+    
+    // Stage 3: Context-aware search using conversation history
+    const contextResults = performContextualSearch(queryEmbedding, conversationContext, topK * 2);
+    
+    // Stage 4: Combine and rerank all results
+    const combinedResults = combineAndRerankResults({
+        semantic: semanticResults,
+        keyword: keywordResults,
+        contextual: contextResults
+    }, query, conversationContext, topK);
+    
+    return combinedResults;
+}
+
+/**
+ * Stage 1: Enhanced semantic search with multiple similarity metrics
+ */
+function performSemanticSearch(queryEmbedding, topK) {
+    const results = knowledgeBase.chunks.map(chunk => {
+        const cosine = cosineSimilarity(queryEmbedding, chunk.embedding);
+        const euclidean = 1 / (1 + euclideanDistance(queryEmbedding, chunk.embedding));
+        const manhattan = 1 / (1 + manhattanDistance(queryEmbedding, chunk.embedding));
+        
+        // Weighted combination of similarity metrics
+        const combinedSimilarity = (cosine * 0.7) + (euclidean * 0.2) + (manhattan * 0.1);
+        
+        return {
+            chunk,
+            similarity: combinedSimilarity,
+            metadata: { ...chunk.metadata, searchType: 'semantic' },
+            scores: { cosine, euclidean, manhattan, combined: combinedSimilarity }
+        };
+    });
+    
+    return results
         .sort((a, b) => b.similarity - a.similarity)
         .slice(0, topK)
-        .filter(result => result.similarity > 0.1); // Filter out very low similarity
+        .filter(result => result.similarity > 0.15);
+}
+
+/**
+ * Stage 2: Keyword-based search for exact matches
+ */
+function performKeywordSearch(query, topK) {
+    if (!query || typeof query !== 'string') {
+        return [];
+    }
+    
+    const queryWords = query.toLowerCase()
+        .replace(/[^\w\s]/g, ' ')
+        .split(/\s+/)
+        .filter(word => word.length > 2);
+    
+    if (queryWords.length === 0) {
+        return [];
+    }
+    
+    const results = knowledgeBase.chunks.map(chunk => {
+        const chunkText = chunk.text.toLowerCase();
+        let score = 0;
+        let exactMatches = 0;
+        let partialMatches = 0;
+        
+        queryWords.forEach(word => {
+            // Exact word match (higher weight)
+            const exactCount = (chunkText.match(new RegExp(`\\b${word}\\b`, 'g')) || []).length;
+            if (exactCount > 0) {
+                exactMatches++;
+                score += exactCount * 2;
+            }
+            
+            // Partial match (lower weight)
+            if (chunkText.includes(word)) {
+                partialMatches++;
+                score += 0.5;
+            }
+        });
+        
+        // Boost score for multiple word matches
+        if (exactMatches > 1) {
+            score *= (1 + exactMatches * 0.2);
+        }
+        
+        const normalizedScore = score / (queryWords.length * 2);
+        
+        return {
+            chunk,
+            similarity: normalizedScore,
+            metadata: { 
+                ...chunk.metadata, 
+                searchType: 'keyword',
+                exactMatches,
+                partialMatches
+            }
+        };
+    });
+    
+    return results
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, topK)
+        .filter(result => result.similarity > 0.1);
+}
+
+/**
+ * Stage 3: Context-aware search using conversation history
+ */
+function performContextualSearch(queryEmbedding, conversationContext, topK) {
+    if (!conversationContext || !conversationContext.entities || conversationContext.entities.length === 0) {
+        return [];
+    }
+    
+    const contextEntities = conversationContext.entities;
+    const results = knowledgeBase.chunks.map(chunk => {
+        let contextScore = 0;
+        let entityMatches = 0;
+        
+        contextEntities.forEach(entity => {
+            const entityRegex = new RegExp(entity.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+            const matches = (chunk.text.match(entityRegex) || []).length;
+            
+            if (matches > 0) {
+                entityMatches++;
+                // Weight by entity type importance
+                const typeWeight = getEntityTypeWeight(entity.type);
+                contextScore += matches * typeWeight;
+            }
+        });
+        
+        // Boost for chunks that match multiple entities
+        if (entityMatches > 1) {
+            contextScore *= (1 + entityMatches * 0.3);
+        }
+        
+        const normalizedScore = Math.min(contextScore / contextEntities.length, 1.0);
+        
+        return {
+            chunk,
+            similarity: normalizedScore,
+            metadata: { 
+                ...chunk.metadata, 
+                searchType: 'contextual',
+                entityMatches,
+                contextScore
+            }
+        };
+    });
+    
+    return results
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, topK)
+        .filter(result => result.similarity > 0.05);
+}
+
+/**
+ * Stage 4: Combine and rerank results from all search stages
+ */
+function combineAndRerankResults(results, query, conversationContext, topK) {
+    const { semantic, keyword, contextual } = results;
+    const combinedMap = new Map();
+    
+    // Combine results with weighted scoring
+    const processResults = (resultList, weight, boost = 1) => {
+        resultList.forEach(result => {
+            const chunkId = result.chunk.id;
+            const weightedScore = result.similarity * weight * boost;
+            
+            if (combinedMap.has(chunkId)) {
+                const existing = combinedMap.get(chunkId);
+                existing.combinedScore += weightedScore;
+                existing.searchTypes.push(result.metadata.searchType);
+                existing.allScores[result.metadata.searchType] = result.similarity;
+            } else {
+                combinedMap.set(chunkId, {
+                    ...result,
+                    combinedScore: weightedScore,
+                    searchTypes: [result.metadata.searchType],
+                    allScores: { [result.metadata.searchType]: result.similarity }
+                });
+            }
+        });
+    };
+    
+    // Weight different search types
+    processResults(semantic, 0.6); // Semantic search base weight
+    processResults(keyword, 0.3, 1.5); // Keyword search with boost for exact matches
+    processResults(contextual, 0.1, 2.0); // Contextual search with high boost
+    
+    // Convert map to array and apply final reranking
+    const finalResults = Array.from(combinedMap.values())
+        .map(result => {
+            // Boost for multiple search type matches
+            const searchTypeBoost = result.searchTypes.length > 1 ? 1.2 : 1.0;
+            
+            // Boost for recent chunks (if timestamp available)
+            const freshnessBoost = calculateFreshnessBoost(result.chunk.metadata);
+            
+            // Apply final scoring
+            result.finalScore = result.combinedScore * searchTypeBoost * freshnessBoost;
+            
+            return result;
+        })
+        .sort((a, b) => b.finalScore - a.finalScore)
+        .slice(0, topK);
+    
+    return finalResults;
+}
+
+/**
+ * Get weight for different entity types
+ */
+function getEntityTypeWeight(entityType) {
+    const weights = {
+        'BUSINESS_INFO': 1.5,
+        'CONTACT': 1.4,
+        'PRODUCT': 1.3,
+        'PRICE': 1.2,
+        'POLICY': 1.1,
+        'PERSON': 1.0,
+        'LOCATION': 0.9,
+        'DATE': 0.8,
+        'OTHER': 0.5
+    };
+    return weights[entityType] || 0.5;
+}
+
+/**
+ * Calculate freshness boost based on chunk metadata
+ */
+function calculateFreshnessBoost(metadata) {
+    if (!metadata || !metadata.lastUpdated) {
+        return 1.0;
+    }
+    
+    const daysSinceUpdate = (Date.now() - metadata.lastUpdated) / (1000 * 60 * 60 * 24);
+    
+    // Boost recent content, but don't penalize older content too much
+    if (daysSinceUpdate <= 7) return 1.1;
+    if (daysSinceUpdate <= 30) return 1.05;
+    if (daysSinceUpdate <= 90) return 1.0;
+    return 0.95;
+}
+
+/**
+ * Enhanced similarity metrics
+ */
+function euclideanDistance(vectorA, vectorB) {
+    if (!vectorA || !vectorB || vectorA.length !== vectorB.length) {
+        return Infinity;
+    }
+    
+    let sum = 0;
+    for (let i = 0; i < vectorA.length; i++) {
+        const diff = vectorA[i] - vectorB[i];
+        sum += diff * diff;
+    }
+    return Math.sqrt(sum);
+}
+
+function manhattanDistance(vectorA, vectorB) {
+    if (!vectorA || !vectorB || vectorA.length !== vectorB.length) {
+        return Infinity;
+    }
+    
+    let sum = 0;
+    for (let i = 0; i < vectorA.length; i++) {
+        sum += Math.abs(vectorA[i] - vectorB[i]);
+    }
+    return sum;
 }
 
 /**
@@ -373,7 +785,707 @@ function cosineSimilarity(vectorA, vectorB) {
 }
 
 /**
- * Generate response using retrieved context
+ * Analyze user query with intent classification and entity extraction
+ */
+async function analyzeQuery(message, conversationContext, requestId) {
+    try {
+        const analysis = {
+            originalQuery: message,
+            intent: 'unknown',
+            intentConfidence: 0,
+            entities: [],
+            expandedQueries: [],
+            contextualReferences: [],
+            isFollowUp: false
+        };
+        
+        // Intent classification
+        const intentResult = await classifyIntent(message, conversationContext);
+        analysis.intent = intentResult.name;
+        analysis.intentConfidence = intentResult.confidence;
+        
+        // Entity extraction
+        analysis.entities = extractEntities(message, conversationContext);
+        
+        // Check if this is a follow-up question
+        analysis.isFollowUp = detectFollowUpQuestion(message, conversationContext);
+        
+        // Resolve contextual references ("it", "that", "this", etc.)
+        analysis.contextualReferences = resolveContextualReferences(message, conversationContext);
+        
+        // Query expansion for better retrieval
+        if (CONFIG.queryExpansionEnabled) {
+            analysis.expandedQueries = await expandQuery(message, analysis, conversationContext);
+        }
+        
+        console.log(`[${requestId}] Query analysis completed:`, {
+            intent: analysis.intent,
+            confidence: analysis.intentConfidence,
+            isFollowUp: analysis.isFollowUp,
+            entities: analysis.entities.length,
+            expansions: analysis.expandedQueries.length
+        });
+        
+        return analysis;
+        
+    } catch (error) {
+        console.error(`[${requestId}] Query analysis error:`, error);
+        // Return basic analysis on error
+        return {
+            originalQuery: message,
+            intent: 'question',
+            intentConfidence: 0.5,
+            entities: [],
+            expandedQueries: [message],
+            contextualReferences: [],
+            isFollowUp: false
+        };
+    }
+}
+
+/**
+ * Classify the intent of the user message
+ */
+async function classifyIntent(message, conversationContext) {
+    const intents = [
+        { name: 'question', keywords: ['what', 'how', 'why', 'when', 'where', 'who', '?'], weight: 1.0 },
+        { name: 'request', keywords: ['can you', 'please', 'help me', 'i need', 'show me'], weight: 1.0 },
+        { name: 'clarification', keywords: ['explain', 'clarify', 'what do you mean', 'more details'], weight: 0.9 },
+        { name: 'confirmation', keywords: ['yes', 'no', 'correct', 'right', 'wrong', 'exactly'], weight: 0.8 },
+        { name: 'greeting', keywords: ['hello', 'hi', 'hey', 'good morning', 'good afternoon'], weight: 0.7 },
+        { name: 'complaint', keywords: ['problem', 'issue', 'error', 'not working', 'broken'], weight: 0.9 },
+        { name: 'compliment', keywords: ['thank you', 'thanks', 'great', 'awesome', 'helpful'], weight: 0.6 }
+    ];
+    
+    const messageLower = message.toLowerCase();
+    let bestIntent = { name: 'question', confidence: 0.5 };
+    let maxScore = 0;
+    
+    for (const intent of intents) {
+        let score = 0;
+        for (const keyword of intent.keywords) {
+            if (messageLower.includes(keyword)) {
+                score += intent.weight;
+            }
+        }
+        
+        // Boost score if this intent has been used recently
+        const recentIntents = conversationContext.intentHistory.slice(-3);
+        const recentIntentCount = recentIntents.filter(h => h.intent === intent.name).length;
+        score += recentIntentCount * 0.1;
+        
+        if (score > maxScore) {
+            maxScore = score;
+            bestIntent = {
+                name: intent.name,
+                confidence: Math.min(score / Math.max(intent.keywords.length, 1), 1.0)
+            };
+        }
+    }
+    
+    return bestIntent;
+}
+
+/**
+ * Extract entities from the message
+ */
+function extractEntities(message, conversationContext) {
+    const entities = [];
+    const messageLower = message.toLowerCase();
+    
+    // Business hours patterns
+    const timePatterns = [
+        { regex: /\b([0-9]{1,2}):?([0-9]{2})\s*(am|pm)\b/gi, type: 'time' },
+        { regex: /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, type: 'day' },
+        { regex: /\b(hours?|schedule|time)\b/gi, type: 'business_info' }
+    ];
+    
+    // Contact information patterns
+    const contactPatterns = [
+        { regex: /\b(phone|call|contact|email|support)\b/gi, type: 'contact' },
+        { regex: /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/gi, type: 'email' },
+        { regex: /\b\d{3}[-.]?\d{3}[-.]?\d{4}\b/gi, type: 'phone' }
+    ];
+    
+    // Product/service patterns
+    const productPatterns = [
+        { regex: /\b(product|service|plan|pricing|cost|price)\b/gi, type: 'product' },
+        { regex: /\$[0-9]+(\.\d{2})?\b/gi, type: 'price' }
+    ];
+    
+    const allPatterns = [...timePatterns, ...contactPatterns, ...productPatterns];
+    
+    allPatterns.forEach(pattern => {
+        let match;
+        while ((match = pattern.regex.exec(message)) !== null) {
+            entities.push({
+                type: pattern.type,
+                value: match[0],
+                position: match.index
+            });
+            
+            // Prevent infinite loop
+            if (!pattern.regex.global) break;
+        }
+    });
+    
+    return entities;
+}
+
+/**
+ * Detect if this is a follow-up question
+ */
+function detectFollowUpQuestion(message, conversationContext) {
+    if (conversationContext.messages.length === 0) {
+        return false;
+    }
+    
+    const followUpIndicators = [
+        'also', 'what about', 'and', 'additionally', 'furthermore',
+        'can you also', 'what else', 'more information', 'tell me more'
+    ];
+    
+    const messageLower = message.toLowerCase();
+    return followUpIndicators.some(indicator => messageLower.includes(indicator));
+}
+
+/**
+ * Resolve contextual references in the message
+ */
+function resolveContextualReferences(message, conversationContext) {
+    const references = [];
+    const messageLower = message.toLowerCase();
+    
+    const pronouns = ['it', 'that', 'this', 'they', 'them', 'those', 'these'];
+    
+    pronouns.forEach(pronoun => {
+        if (messageLower.includes(pronoun)) {
+            // Get the last assistant message for context
+            const lastMessages = conversationContext.messages.slice(-4);
+            const lastAssistantMessage = lastMessages.reverse().find(msg => msg.type === 'assistant');
+            
+            if (lastAssistantMessage) {
+                references.push({
+                    pronoun,
+                    referenceContext: lastAssistantMessage.content.substring(0, 100)
+                });
+            }
+        }
+    });
+    
+    return references;
+}
+
+/**
+ * Expand query for better retrieval
+ */
+async function expandQuery(originalQuery, analysis, conversationContext) {
+    const expandedQueries = [originalQuery];
+    
+    try {
+        // Add context from recent conversation
+        if (conversationContext.messages.length > 0) {
+            const recentContext = conversationContext.messages
+                .slice(-4)
+                .filter(msg => msg.type === 'user')
+                .map(msg => msg.content)
+                .join(' ');
+            
+            if (recentContext && recentContext !== originalQuery) {
+                expandedQueries.push(`${recentContext} ${originalQuery}`);
+            }
+        }
+        
+        // Add entity-based expansions
+        analysis.entities.forEach(entity => {
+            if (entity.type === 'business_info') {
+                expandedQueries.push(`business information ${originalQuery}`);
+            } else if (entity.type === 'contact') {
+                expandedQueries.push(`contact support ${originalQuery}`);
+            } else if (entity.type === 'product') {
+                expandedQueries.push(`product information ${originalQuery}`);
+            }
+        });
+        
+        // Intent-based expansion
+        if (analysis.intent === 'question') {
+            expandedQueries.push(`FAQ ${originalQuery}`);
+        } else if (analysis.intent === 'request') {
+            expandedQueries.push(`how to ${originalQuery}`);
+        }
+        
+        // Limit expansions
+        return expandedQueries.slice(0, CONFIG.maxQueryExpansions + 1);
+        
+    } catch (error) {
+        console.error('Query expansion error:', error);
+        return [originalQuery];
+    }
+}
+
+/**
+ * Context-aware retrieval with enhanced scoring
+ */
+async function performContextAwareRetrieval(queryAnalysis, conversationContext, requestId) {
+    try {
+        const allChunks = [];
+        const chunkScores = new Map();
+        
+        // Process each expanded query
+        for (const query of queryAnalysis.expandedQueries) {
+            const queryEmbedding = await generateEmbedding(query);
+            const chunks = searchSimilarChunks(queryEmbedding, CONFIG.maxRetrievalChunks * 2, query, conversationContext);
+            
+            chunks.forEach(chunk => {
+                const chunkId = chunk.chunk.id;
+                const baseScore = chunk.similarity;
+                
+                // Context boost based on conversation history
+                let contextBoost = 0;
+                if (conversationContext.messages.length > 0) {
+                    const recentTopics = extractTopicsFromHistory(conversationContext);
+                    contextBoost = calculateContextBoost(chunk.chunk.text, recentTopics);
+                }
+                
+                // Intent alignment boost
+                const intentBoost = calculateIntentBoost(chunk.chunk.text, queryAnalysis.intent);
+                
+                // Entity alignment boost
+                const entityBoost = calculateEntityBoost(chunk.chunk.text, queryAnalysis.entities);
+                
+                const finalScore = baseScore + (contextBoost * CONFIG.contextWeight) + intentBoost + entityBoost;
+                
+                if (!chunkScores.has(chunkId) || chunkScores.get(chunkId).score < finalScore) {
+                    chunkScores.set(chunkId, {
+                        chunk: chunk.chunk,
+                        score: finalScore,
+                        baseScore,
+                        contextBoost,
+                        intentBoost,
+                        entityBoost,
+                        metadata: chunk.metadata
+                    });
+                }
+            });
+        }
+        
+        // Sort and return top chunks
+        const sortedChunks = Array.from(chunkScores.values())
+            .sort((a, b) => b.score - a.score)
+            .slice(0, CONFIG.maxRetrievalChunks);
+        
+        const result = {
+            chunks: sortedChunks,
+            bestSimilarity: sortedChunks.length > 0 ? sortedChunks[0].baseScore : 0,
+            contextBoost: sortedChunks.length > 0 ? sortedChunks[0].contextBoost : 0,
+            averageScore: sortedChunks.length > 0 ? 
+                sortedChunks.reduce((sum, chunk) => sum + chunk.score, 0) / sortedChunks.length : 0
+        };
+        
+        console.log(`[${requestId}] Context-aware retrieval completed:`, {
+            totalChunksEvaluated: chunkScores.size,
+            finalChunksSelected: sortedChunks.length,
+            bestScore: result.bestSimilarity,
+            averageScore: result.averageScore
+        });
+        
+        return result;
+        
+    } catch (error) {
+        console.error(`[${requestId}] Context-aware retrieval error:`, error);
+        // Fallback to basic retrieval
+        const queryEmbedding = await generateEmbedding(queryAnalysis.originalQuery);
+        const chunks = searchSimilarChunks(queryEmbedding, CONFIG.maxRetrievalChunks, queryAnalysis.originalQuery, conversationContext);
+        return {
+            chunks: chunks.map(chunk => ({ ...chunk, score: chunk.similarity })),
+            bestSimilarity: chunks.length > 0 ? chunks[0].similarity : 0,
+            contextBoost: 0,
+            averageScore: chunks.length > 0 ? 
+                chunks.reduce((sum, chunk) => sum + chunk.similarity, 0) / chunks.length : 0
+        };
+    }
+}
+
+/**
+ * Extract topics from conversation history
+ */
+function extractTopicsFromHistory(conversationContext) {
+    const topics = new Set();
+    
+    conversationContext.messages.forEach(msg => {
+        if (msg.type === 'user' && msg.entities) {
+            msg.entities.forEach(entity => {
+                topics.add(entity.type);
+            });
+        }
+    });
+    
+    return Array.from(topics);
+}
+
+/**
+ * Calculate context boost based on conversation topics
+ */
+function calculateContextBoost(chunkText, recentTopics) {
+    let boost = 0;
+    const chunkLower = chunkText.toLowerCase();
+    
+    recentTopics.forEach(topic => {
+        const topicKeywords = getTopicKeywords(topic);
+        topicKeywords.forEach(keyword => {
+            if (chunkLower.includes(keyword)) {
+                boost += 0.1;
+            }
+        });
+    });
+    
+    return Math.min(boost, 0.3); // Cap boost at 0.3
+}
+
+/**
+ * Get keywords for a topic
+ */
+function getTopicKeywords(topic) {
+    const keywordMap = {
+        'business_info': ['hours', 'contact', 'business', 'support'],
+        'contact': ['email', 'phone', 'call', 'contact', 'support'],
+        'product': ['product', 'service', 'pricing', 'plan', 'offer'],
+        'time': ['hours', 'schedule', 'time', 'open', 'closed'],
+        'day': ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+    };
+    
+    return keywordMap[topic] || [];
+}
+
+/**
+ * Calculate intent alignment boost
+ */
+function calculateIntentBoost(chunkText, intent) {
+    const intentKeywords = {
+        'question': ['what', 'how', 'when', 'where', 'why'],
+        'request': ['help', 'can', 'please', 'need'],
+        'complaint': ['problem', 'issue', 'error', 'not working'],
+        'greeting': ['welcome', 'hello', 'help']
+    };
+    
+    const keywords = intentKeywords[intent] || [];
+    const chunkLower = chunkText.toLowerCase();
+    
+    let boost = 0;
+    keywords.forEach(keyword => {
+        if (chunkLower.includes(keyword)) {
+            boost += 0.05;
+        }
+    });
+    
+    return Math.min(boost, 0.2); // Cap boost at 0.2
+}
+
+/**
+ * Calculate entity alignment boost
+ */
+function calculateEntityBoost(chunkText, entities) {
+    let boost = 0;
+    const chunkLower = chunkText.toLowerCase();
+    
+    entities.forEach(entity => {
+        if (chunkLower.includes(entity.value.toLowerCase())) {
+            boost += 0.1;
+        }
+    });
+    
+    return Math.min(boost, 0.25); // Cap boost at 0.25
+}
+
+/**
+ * Generate multiple candidate responses
+ */
+async function generateCandidateResponses(queryAnalysis, retrievalResults, conversationContext, requestId) {
+    try {
+        const candidates = [];
+        
+        // Generate primary response with full context
+        const primaryCandidate = await generateContextAwareResponse(
+            queryAnalysis, 
+            retrievalResults, 
+            conversationContext, 
+            'comprehensive'
+        );
+        candidates.push({ ...primaryCandidate, type: 'comprehensive' });
+        
+        // Generate concise response if confidence is high
+        if (retrievalResults.bestSimilarity > 0.7) {
+            const conciseCandidate = await generateContextAwareResponse(
+                queryAnalysis, 
+                retrievalResults, 
+                conversationContext, 
+                'concise'
+            );
+            candidates.push({ ...conciseCandidate, type: 'concise' });
+        }
+        
+        // Generate explanatory response for complex queries
+        if (queryAnalysis.entities.length > 2 || queryAnalysis.isFollowUp) {
+            const explanatoryCandidate = await generateContextAwareResponse(
+                queryAnalysis, 
+                retrievalResults, 
+                conversationContext, 
+                'explanatory'
+            );
+            candidates.push({ ...explanatoryCandidate, type: 'explanatory' });
+        }
+        
+        console.log(`[${requestId}] Generated ${candidates.length} candidate responses`);
+        return candidates;
+        
+    } catch (error) {
+        console.error(`[${requestId}] Candidate generation error:`, error);
+        // Fallback to single response
+        const fallbackResponse = await generateResponse(queryAnalysis.originalQuery, 
+            retrievalResults.chunks.map(chunk => ({ chunk: chunk.chunk, similarity: chunk.score })));
+        return [{ 
+            text: fallbackResponse, 
+            confidence: retrievalResults.bestSimilarity,
+            type: 'fallback'
+        }];
+    }
+}
+
+/**
+ * Generate context-aware response with dynamic prompting
+ */
+async function generateContextAwareResponse(queryAnalysis, retrievalResults, conversationContext, responseType) {
+    try {
+        const context = retrievalResults.chunks
+            .map(result => `- ${result.chunk.text}`)
+            .join('\n');
+        
+        // Build conversation history context
+        const conversationHistory = conversationContext.messages
+            .slice(-6) // Last 3 exchanges
+            .map(msg => `${msg.type === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
+            .join('\n');
+        
+        // Dynamic prompt based on response type and context
+        let prompt = buildDynamicPrompt(
+            queryAnalysis, 
+            context, 
+            conversationHistory, 
+            responseType, 
+            conversationContext
+        );
+        
+        const generationStartTime = Date.now();
+        const result = await chatModel.generateContent({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: {
+                maxOutputTokens: getMaxTokensForResponseType(responseType),
+                temperature: getTemperatureForResponseType(responseType),
+                topP: 0.8,
+                topK: 40
+            }
+        });
+        
+        performanceMonitor.recordGeneration(Date.now() - generationStartTime);
+        
+        const responseText = result.response.text();
+        
+        // Calculate confidence based on multiple factors
+        const confidence = calculateResponseConfidence(retrievalResults, queryAnalysis, responseText);
+        
+        return {
+            text: responseText,
+            confidence,
+            sources: retrievalResults.chunks.map(chunk => chunk.metadata?.source || 'knowledge_base').filter(Boolean)
+        };
+        
+    } catch (error) {
+        console.error('Context-aware response generation error:', error);
+        throw error;
+    }
+}
+
+/**
+ * Build dynamic prompt based on context and response type
+ */
+function buildDynamicPrompt(queryAnalysis, context, conversationHistory, responseType, conversationContext) {
+    let basePrompt = `You are RagZzy, a helpful customer support assistant.`;
+    
+    // Add conversation context if available
+    if (conversationHistory) {
+        basePrompt += `\n\nPrevious conversation:\n${conversationHistory}`;
+    }
+    
+    // Add current context
+    if (context) {
+        basePrompt += `\n\nRelevant information:\n${context}`;
+    }
+    
+    // Add current query
+    basePrompt += `\n\nCurrent question: ${queryAnalysis.originalQuery}`;
+    
+    // Add contextual references if detected
+    if (queryAnalysis.contextualReferences.length > 0) {
+        basePrompt += `\n\nNote: The user used references like "${queryAnalysis.contextualReferences.map(ref => ref.pronoun).join(', ')}" which may refer to previous discussion topics.`;
+    }
+    
+    // Response type specific instructions
+    const responseInstructions = {
+        'comprehensive': 'Provide a detailed, thorough response that fully addresses the question. Include relevant details and context.',
+        'concise': 'Provide a brief, direct answer that gets straight to the point while being helpful.',
+        'explanatory': 'Provide a clear explanation with step-by-step details or background information to help the user understand.'
+    };
+    
+    basePrompt += `\n\n${responseInstructions[responseType] || responseInstructions['comprehensive']}`;
+    
+    // Add personalization based on conversation history
+    if (conversationContext.successfulResponses > 2) {
+        basePrompt += ` The user has been having a good experience with previous responses, so maintain that helpful tone.`;
+    }
+    
+    // Add intent-specific guidance
+    if (queryAnalysis.intent === 'clarification') {
+        basePrompt += ` The user is asking for clarification, so be extra clear and specific in your explanation.`;
+    } else if (queryAnalysis.intent === 'complaint') {
+        basePrompt += ` The user seems to have an issue or concern. Be empathetic and solution-focused.`;
+    } else if (queryAnalysis.isFollowUp) {
+        basePrompt += ` This appears to be a follow-up question, so connect your response to the previous conversation.`;
+    }
+    
+    basePrompt += `\n\nResponse:`;
+    
+    return basePrompt;
+}
+
+/**
+ * Get max tokens based on response type
+ */
+function getMaxTokensForResponseType(responseType) {
+    const tokenLimits = {
+        'concise': 300,
+        'comprehensive': 800,
+        'explanatory': 600
+    };
+    
+    return tokenLimits[responseType] || CONFIG.maxResponseTokens;
+}
+
+/**
+ * Get temperature based on response type
+ */
+function getTemperatureForResponseType(responseType) {
+    const temperatures = {
+        'concise': 0.3,
+        'comprehensive': 0.7,
+        'explanatory': 0.5
+    };
+    
+    return temperatures[responseType] || 0.7;
+}
+
+/**
+ * Calculate response confidence based on multiple factors
+ */
+function calculateResponseConfidence(retrievalResults, queryAnalysis, responseText) {
+    let confidence = retrievalResults.bestSimilarity;
+    
+    // Boost confidence for high intent confidence
+    if (queryAnalysis.intentConfidence > 0.8) {
+        confidence += 0.1;
+    }
+    
+    // Boost confidence if multiple chunks contribute
+    if (retrievalResults.chunks.length > 2) {
+        confidence += 0.05;
+    }
+    
+    // Reduce confidence for very short responses (may indicate lack of info)
+    if (responseText.length < 50) {
+        confidence -= 0.1;
+    }
+    
+    // Boost confidence if response contains specific information
+    const specificityIndicators = ['contact', 'email', 'phone', 'hours', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday'];
+    const hasSpecificInfo = specificityIndicators.some(indicator => 
+        responseText.toLowerCase().includes(indicator)
+    );
+    
+    if (hasSpecificInfo) {
+        confidence += 0.1;
+    }
+    
+    return Math.min(Math.max(confidence, 0), 1); // Clamp between 0 and 1
+}
+
+/**
+ * Select the best response from candidates
+ */
+async function selectBestResponse(candidateResponses, queryAnalysis, conversationContext) {
+    if (candidateResponses.length === 1) {
+        return {
+            ...candidateResponses[0],
+            selectionReason: 'only_candidate',
+            qualityScore: candidateResponses[0].confidence
+        };
+    }
+    
+    let bestCandidate = candidateResponses[0];
+    let bestScore = calculateResponseQualityScore(candidateResponses[0], queryAnalysis, conversationContext);
+    let selectionReason = 'highest_quality_score';
+    
+    for (let i = 1; i < candidateResponses.length; i++) {
+        const candidate = candidateResponses[i];
+        const score = calculateResponseQualityScore(candidate, queryAnalysis, conversationContext);
+        
+        if (score > bestScore) {
+            bestCandidate = candidate;
+            bestScore = score;
+        }
+    }
+    
+    return {
+        ...bestCandidate,
+        selectionReason,
+        qualityScore: bestScore
+    };
+}
+
+/**
+ * Calculate overall quality score for response selection
+ */
+function calculateResponseQualityScore(candidate, queryAnalysis, conversationContext) {
+    let score = candidate.confidence * 0.4; // Base confidence weight
+    
+    // Length appropriateness (not too short, not too long)
+    const length = candidate.text.length;
+    if (length >= 50 && length <= 500) {
+        score += 0.2;
+    } else if (length > 500) {
+        score += 0.1; // Penalize very long responses slightly
+    }
+    
+    // Response type preference based on intent
+    if (queryAnalysis.intent === 'question' && candidate.type === 'comprehensive') {
+        score += 0.1;
+    } else if (queryAnalysis.intent === 'clarification' && candidate.type === 'explanatory') {
+        score += 0.1;
+    } else if (queryAnalysis.intent === 'greeting' && candidate.type === 'concise') {
+        score += 0.1;
+    }
+    
+    // User preference based on history
+    const userSuccessRate = conversationContext.totalResponses > 0 ? 
+        conversationContext.successfulResponses / conversationContext.totalResponses : 0.5;
+    
+    if (userSuccessRate > 0.8 && candidate.type === 'comprehensive') {
+        score += 0.1; // User likes detailed responses
+    }
+    
+    return Math.min(score, 1.0);
+}
+
+/**
+ * Generate response using retrieved context (legacy function - kept for backward compatibility)
  */
 async function generateResponse(userQuery, retrievedChunks) {
     try {
@@ -512,6 +1624,351 @@ function generateId() {
     return Math.random().toString(36).substr(2, 9) + '_' + Date.now();
 }
 
+/**
+ * Categorize and format errors for consistent error responses
+ */
+function categorizeError(error, requestId, processingTime) {
+    console.error(`[${requestId}] Error details:`, {
+        message: error.message,
+        stack: error.stack?.substring(0, 500),
+        type: error.constructor.name
+    });
+    
+    // API-related errors
+    if (error.message?.includes('API key') || error.message?.includes('authentication')) {
+        return {
+            status: 500,
+            body: {
+                error: 'Service temporarily unavailable due to authentication issues',
+                code: 'AUTH_ERROR',
+                requestId,
+                processingTime,
+                retryable: false
+            }
+        };
+    }
+    
+    // Rate limiting and quota errors
+    if (error.message?.includes('quota') || error.message?.includes('rate limit') || error.message?.includes('429')) {
+        return {
+            status: 429,
+            body: {
+                error: 'Too many requests. Please try again in a moment.',
+                code: 'RATE_LIMITED',
+                requestId,
+                processingTime,
+                retryable: true,
+                retryAfter: 60
+            }
+        };
+    }
+    
+    // Network timeout errors
+    if (error.message?.includes('timeout') || error.code === 'ETIMEDOUT') {
+        return {
+            status: 504,
+            body: {
+                error: 'Request timed out. Please try again.',
+                code: 'TIMEOUT_ERROR',
+                requestId,
+                processingTime,
+                retryable: true
+            }
+        };
+    }
+    
+    // Memory or resource errors
+    if (error.message?.includes('out of memory') || error.message?.includes('resource')) {
+        return {
+            status: 503,
+            body: {
+                error: 'Service temporarily overloaded. Please try again.',
+                code: 'RESOURCE_ERROR',
+                requestId,
+                processingTime,
+                retryable: true,
+                retryAfter: 30
+            }
+        };
+    }
+    
+    // Validation or input errors
+    if (error.message?.includes('invalid') || error.message?.includes('validation')) {
+        return {
+            status: 400,
+            body: {
+                error: 'Invalid input provided',
+                code: 'VALIDATION_ERROR',
+                requestId,
+                processingTime,
+                retryable: false
+            }
+        };
+    }
+    
+    // AI model specific errors
+    if (error.message?.includes('model') || error.message?.includes('generation')) {
+        return {
+            status: 502,
+            body: {
+                error: 'AI service temporarily unavailable',
+                code: 'AI_SERVICE_ERROR',
+                requestId,
+                processingTime,
+                retryable: true
+            }
+        };
+    }
+    
+    // Knowledge base errors
+    if (error.message?.includes('knowledge') || error.message?.includes('embedding')) {
+        return {
+            status: 500,
+            body: {
+                error: 'Knowledge base temporarily unavailable',
+                code: 'KNOWLEDGE_BASE_ERROR',
+                requestId,
+                processingTime,
+                retryable: true
+            }
+        };
+    }
+    
+    // Generic server errors
+    return {
+        status: 500,
+        body: {
+            error: 'An unexpected error occurred. Please try again.',
+            code: 'INTERNAL_ERROR',
+            requestId,
+            processingTime,
+            retryable: true
+        }
+    };
+}
+
+/**
+ * Performance monitoring and metrics collection
+ */
+class PerformanceMonitor {
+    constructor() {
+        this.metrics = {
+            requests: {
+                total: 0,
+                successful: 0,
+                failed: 0,
+                averageResponseTime: 0
+            },
+            ai: {
+                embeddingCalls: 0,
+                generationCalls: 0,
+                averageEmbeddingTime: 0,
+                averageGenerationTime: 0
+            },
+            context: {
+                activeSessions: 0,
+                averageMessagesPerSession: 0,
+                contextBoostAverage: 0
+            },
+            errors: new Map() // error type -> count
+        };
+        this.responseTimes = [];
+        this.embeddingTimes = [];
+        this.generationTimes = [];
+    }
+    
+    recordRequest(success, responseTime) {
+        this.metrics.requests.total++;
+        if (success) {
+            this.metrics.requests.successful++;
+        } else {
+            this.metrics.requests.failed++;
+        }
+        
+        this.responseTimes.push(responseTime);
+        if (this.responseTimes.length > 100) {
+            this.responseTimes = this.responseTimes.slice(-100);
+        }
+        
+        this.metrics.requests.averageResponseTime = 
+            this.responseTimes.reduce((sum, time) => sum + time, 0) / this.responseTimes.length;
+    }
+    
+    recordEmbedding(time) {
+        this.metrics.ai.embeddingCalls++;
+        this.embeddingTimes.push(time);
+        if (this.embeddingTimes.length > 50) {
+            this.embeddingTimes = this.embeddingTimes.slice(-50);
+        }
+        
+        this.metrics.ai.averageEmbeddingTime = 
+            this.embeddingTimes.reduce((sum, time) => sum + time, 0) / this.embeddingTimes.length;
+    }
+    
+    recordGeneration(time) {
+        this.metrics.ai.generationCalls++;
+        this.generationTimes.push(time);
+        if (this.generationTimes.length > 50) {
+            this.generationTimes = this.generationTimes.slice(-50);
+        }
+        
+        this.metrics.ai.averageGenerationTime = 
+            this.generationTimes.reduce((sum, time) => sum + time, 0) / this.generationTimes.length;
+    }
+    
+    recordError(errorCode) {
+        const count = this.metrics.errors.get(errorCode) || 0;
+        this.metrics.errors.set(errorCode, count + 1);
+    }
+    
+    updateContextMetrics() {
+        this.metrics.context.activeSessions = conversationContexts.size;
+        
+        if (conversationContexts.size > 0) {
+            const totalMessages = Array.from(conversationContexts.values())
+                .reduce((sum, context) => sum + context.messages.length, 0);
+            this.metrics.context.averageMessagesPerSession = totalMessages / conversationContexts.size;
+        }
+    }
+    
+    getMetrics() {
+        this.updateContextMetrics();
+        return {
+            ...this.metrics,
+            errors: Object.fromEntries(this.metrics.errors),
+            timestamp: Date.now()
+        };
+    }
+    
+    getHealthStatus() {
+        const metrics = this.getMetrics();
+        const errorRate = metrics.requests.total > 0 ? 
+            metrics.requests.failed / metrics.requests.total : 0;
+        
+        let status = 'healthy';
+        const issues = [];
+        
+        if (errorRate > 0.1) {
+            status = 'degraded';
+            issues.push(`High error rate: ${(errorRate * 100).toFixed(1)}%`);
+        }
+        
+        if (metrics.requests.averageResponseTime > 10000) {
+            status = 'degraded';
+            issues.push(`High response time: ${metrics.requests.averageResponseTime.toFixed(0)}ms`);
+        }
+        
+        if (metrics.context.activeSessions > 1000) {
+            status = 'warning';
+            issues.push(`High session count: ${metrics.context.activeSessions}`);
+        }
+        
+        return {
+            status,
+            issues,
+            metrics
+        };
+    }
+}
+
+// Global performance monitor instance
+const performanceMonitor = new PerformanceMonitor();
+
+/**
+ * Enhanced embedding generation with caching and performance monitoring
+ */
+const embeddingCache = new Map();
+const EMBEDDING_CACHE_SIZE = 1000;
+const EMBEDDING_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+async function generateEmbeddingWithCache(text) {
+    const startTime = Date.now();
+    
+    try {
+        // Create cache key
+        const cacheKey = createCacheKey(text);
+        const cached = embeddingCache.get(cacheKey);
+        
+        if (cached && Date.now() - cached.timestamp < EMBEDDING_CACHE_TTL) {
+            performanceMonitor.recordEmbedding(Date.now() - startTime);
+            return cached.embedding;
+        }
+        
+        // Generate new embedding
+        const result = await embeddingModel.embedContent(text);
+        const embedding = result.embedding.values;
+        
+        // Cache the result
+        if (embeddingCache.size >= EMBEDDING_CACHE_SIZE) {
+            // Remove oldest entries
+            const oldestKey = embeddingCache.keys().next().value;
+            embeddingCache.delete(oldestKey);
+        }
+        
+        embeddingCache.set(cacheKey, {
+            embedding,
+            timestamp: Date.now()
+        });
+        
+        performanceMonitor.recordEmbedding(Date.now() - startTime);
+        return embedding;
+        
+    } catch (error) {
+        performanceMonitor.recordEmbedding(Date.now() - startTime);
+        console.error('Error generating embedding:', error);
+        throw error;
+    }
+}
+
+/**
+ * Create a cache key for text
+ */
+function createCacheKey(text) {
+    // Simple hash function for cache key
+    let hash = 0;
+    for (let i = 0; i < text.length; i++) {
+        const char = text.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash; // Convert to 32-bit integer
+    }
+    return hash.toString();
+}
+
+/**
+ * Memory management for conversation contexts
+ */
+function optimizeMemoryUsage() {
+    const now = Date.now();
+    let cleanedSessions = 0;
+    
+    // Clean up expired sessions
+    for (const [sessionId, context] of conversationContexts.entries()) {
+        if (now - context.lastActivity > SESSION_TIMEOUT) {
+            conversationContexts.delete(sessionId);
+            cleanedSessions++;
+        }
+    }
+    
+    // Clean up embedding cache if it's getting too large
+    if (embeddingCache.size > EMBEDDING_CACHE_SIZE * 1.2) {
+        const entries = Array.from(embeddingCache.entries());
+        const sortedEntries = entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+        
+        // Keep only the most recent entries
+        embeddingCache.clear();
+        sortedEntries.slice(-EMBEDDING_CACHE_SIZE).forEach(([key, value]) => {
+            embeddingCache.set(key, value);
+        });
+    }
+    
+    if (cleanedSessions > 0) {
+        console.log(`Memory optimization: cleaned ${cleanedSessions} expired sessions, cache size: ${embeddingCache.size}`);
+    }
+}
+
+// Run memory optimization every 10 minutes
+setInterval(optimizeMemoryUsage, 10 * 60 * 1000);
+
 // Add user contributions to knowledge base
 function addUserContribution(question, answer, metadata = {}) {
     if (!knowledgeBase) {
@@ -539,7 +1996,561 @@ ${answer}`;
     };
 }
 
-// Export for use in contribution endpoint
+/**
+ * Advanced personalization and learning system
+ */
+function updateUserProfile(sessionId, userAction, context) {
+    try {
+        const userId = extractUserIdFromSession(sessionId);
+        if (!userId) return;
+        
+        if (!userProfiles.has(userId)) {
+            userProfiles.set(userId, {
+                preferences: {
+                    responseLength: 'medium', // short, medium, long
+                    responseStyle: 'helpful', // concise, detailed, helpful, technical
+                    topics: new Map(), // topic -> interest score
+                    entities: new Map() // entity -> relevance score
+                },
+                interactions: {
+                    totalQueries: 0,
+                    successfulInteractions: 0,
+                    averageSessionLength: 0,
+                    commonQueryTypes: new Map(),
+                    timeOfDayPatterns: new Map()
+                },
+                learning: {
+                    responseQualityFeedback: [],
+                    topicExpertise: new Map(),
+                    conversationPatterns: []
+                },
+                created: Date.now(),
+                lastActivity: Date.now()
+            });
+        }
+        
+        const profile = userProfiles.get(userId);
+        profile.lastActivity = Date.now();
+        
+        // Update based on user action
+        switch (userAction.type) {
+            case 'query':
+                updateQueryInteraction(profile, userAction, context);
+                break;
+            case 'feedback':
+                updateFeedbackData(profile, userAction, context);
+                break;
+            case 'contribution':
+                updateContributionData(profile, userAction, context);
+                break;
+            case 'session_end':
+                updateSessionData(profile, userAction, context);
+                break;
+        }
+        
+        // Cleanup old data
+        cleanupUserProfile(profile);
+        
+    } catch (error) {
+        console.error('Error updating user profile:', error);
+    }
+}
+
+function updateQueryInteraction(profile, action, context) {
+    profile.interactions.totalQueries++;
+    
+    // Track query type patterns
+    const queryType = context.queryAnalysis?.intent || 'unknown';
+    const currentCount = profile.interactions.commonQueryTypes.get(queryType) || 0;
+    profile.interactions.commonQueryTypes.set(queryType, currentCount + 1);
+    
+    // Track time of day patterns
+    const hour = new Date().getHours();
+    const timeSlot = getTimeSlot(hour);
+    const timeCount = profile.interactions.timeOfDayPatterns.get(timeSlot) || 0;
+    profile.interactions.timeOfDayPatterns.set(timeSlot, timeCount + 1);
+    
+    // Update topic interests
+    if (context.entities) {
+        context.entities.forEach(entity => {
+            const currentScore = profile.preferences.topics.get(entity.type) || 0;
+            profile.preferences.topics.set(entity.type, currentScore + 0.1);
+        });
+    }
+    
+    // Infer response style preferences based on query complexity
+    const queryLength = action.query.length;
+    if (queryLength > 100) {
+        // Complex queries suggest preference for detailed responses
+        adjustPreference(profile.preferences, 'responseStyle', 'detailed', 0.1);
+        adjustPreference(profile.preferences, 'responseLength', 'long', 0.1);
+    } else if (queryLength < 30) {
+        // Short queries suggest preference for concise responses
+        adjustPreference(profile.preferences, 'responseStyle', 'concise', 0.1);
+        adjustPreference(profile.preferences, 'responseLength', 'short', 0.1);
+    }
+}
+
+function updateFeedbackData(profile, action, context) {
+    profile.learning.responseQualityFeedback.push({
+        responseId: action.responseId,
+        rating: action.rating,
+        feedback: action.feedback,
+        timestamp: Date.now(),
+        context: {
+            queryType: context.queryType,
+            responseLength: context.responseLength,
+            confidence: context.confidence
+        }
+    });
+    
+    // Learn from positive/negative feedback
+    if (action.rating >= 4) {
+        profile.interactions.successfulInteractions++;
+        // Boost preferences that led to good responses
+        if (context.responseStyle) {
+            adjustPreference(profile.preferences, 'responseStyle', context.responseStyle, 0.2);
+        }
+        if (context.responseLength) {
+            adjustPreference(profile.preferences, 'responseLength', context.responseLength, 0.2);
+        }
+    } else if (action.rating <= 2) {
+        // Reduce preferences that led to poor responses
+        if (context.responseStyle) {
+            adjustPreference(profile.preferences, 'responseStyle', context.responseStyle, -0.1);
+        }
+    }
+    
+    // Keep only recent feedback (last 100 items)
+    if (profile.learning.responseQualityFeedback.length > 100) {
+        profile.learning.responseQualityFeedback = profile.learning.responseQualityFeedback.slice(-100);
+    }
+}
+
+function updateContributionData(profile, action, context) {
+    // Track expertise areas based on contributions
+    const category = action.category || 'general';
+    const currentExpertise = profile.learning.topicExpertise.get(category) || 0;
+    profile.learning.topicExpertise.set(category, currentExpertise + 1);
+    
+    // Contributors tend to prefer more detailed, helpful responses
+    adjustPreference(profile.preferences, 'responseStyle', 'helpful', 0.2);
+    adjustPreference(profile.preferences, 'responseLength', 'medium', 0.1);
+}
+
+function updateSessionData(profile, action, context) {
+    const sessionLength = action.sessionDuration || 0;
+    
+    // Update average session length (exponential moving average)
+    const alpha = 0.1; // smoothing factor
+    profile.interactions.averageSessionLength = 
+        (1 - alpha) * profile.interactions.averageSessionLength + alpha * sessionLength;
+}
+
+function adjustPreference(preferences, category, value, adjustment) {
+    if (!preferences[category + 'Scores']) {
+        preferences[category + 'Scores'] = new Map();
+    }
+    
+    const scores = preferences[category + 'Scores'];
+    const currentScore = scores.get(value) || 0;
+    scores.set(value, Math.max(0, Math.min(1, currentScore + adjustment)));
+    
+    // Update the primary preference to the highest scoring option
+    let maxScore = 0;
+    let bestOption = preferences[category];
+    
+    for (const [option, score] of scores.entries()) {
+        if (score > maxScore) {
+            maxScore = score;
+            bestOption = option;
+        }
+    }
+    
+    preferences[category] = bestOption;
+}
+
+function getTimeSlot(hour) {
+    if (hour >= 6 && hour < 12) return 'morning';
+    if (hour >= 12 && hour < 17) return 'afternoon';
+    if (hour >= 17 && hour < 22) return 'evening';
+    return 'night';
+}
+
+function cleanupUserProfile(profile) {
+    const oneWeekAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    
+    // Remove old feedback
+    profile.learning.responseQualityFeedback = profile.learning.responseQualityFeedback
+        .filter(feedback => feedback.timestamp > oneWeekAgo);
+    
+    // Decay topic interests over time
+    for (const [topic, score] of profile.preferences.topics.entries()) {
+        const decayedScore = score * 0.99; // 1% decay
+        if (decayedScore < 0.01) {
+            profile.preferences.topics.delete(topic);
+        } else {
+            profile.preferences.topics.set(topic, decayedScore);
+        }
+    }
+}
+
+function extractUserIdFromSession(sessionId) {
+    // In a real system, this would map sessions to authenticated users
+    // For now, use sessionId as a proxy for user identification
+    return sessionId ? `user_${sessionId.substring(0, 16)}` : null;
+}
+
+function getPersonalizedResponseInstructions(sessionId, queryAnalysis) {
+    try {
+        const userId = extractUserIdFromSession(sessionId);
+        if (!userId || !userProfiles.has(userId)) {
+            return null;
+        }
+        
+        const profile = userProfiles.get(userId);
+        const preferences = profile.preferences;
+        
+        let instructions = [];
+        
+        // Response length preference
+        switch (preferences.responseLength) {
+            case 'short':
+                instructions.push('Keep the response concise and to the point (1-2 sentences).');
+                break;
+            case 'long':
+                instructions.push('Provide a comprehensive, detailed response with examples and context.');
+                break;
+            default:
+                instructions.push('Provide a moderately detailed response that covers the key points.');
+        }
+        
+        // Response style preference
+        switch (preferences.responseStyle) {
+            case 'concise':
+                instructions.push('Use clear, direct language without unnecessary elaboration.');
+                break;
+            case 'detailed':
+                instructions.push('Include relevant details, examples, and background information.');
+                break;
+            case 'technical':
+                instructions.push('Use precise, technical language appropriate for an expert audience.');
+                break;
+            default:
+                instructions.push('Use a helpful, friendly tone that balances clarity with completeness.');
+        }
+        
+        // Topic-specific adjustments
+        const queryTopics = queryAnalysis.entities
+            ?.map(entity => entity.type)
+            .filter(type => preferences.topics.has(type)) || [];
+        
+        if (queryTopics.length > 0) {
+            const topicScores = queryTopics.map(topic => preferences.topics.get(topic));
+            const avgInterest = topicScores.reduce((sum, score) => sum + score, 0) / topicScores.length;
+            
+            if (avgInterest > 0.7) {
+                instructions.push('The user has shown high interest in this topic, so provide additional depth and related information.');
+            } else if (avgInterest < 0.3) {
+                instructions.push('Keep the response accessible and avoid overwhelming technical details.');
+            }
+        }
+        
+        // Time-based adjustments
+        const currentTimeSlot = getTimeSlot(new Date().getHours());
+        const timePattern = profile.interactions.timeOfDayPatterns.get(currentTimeSlot) || 0;
+        
+        if (timePattern > 10 && currentTimeSlot === 'morning') {
+            instructions.push('Consider that this is a morning query - the user may want quick, actionable information.');
+        }
+        
+        return instructions.length > 0 ? instructions.join(' ') : null;
+        
+    } catch (error) {
+        console.error('Error generating personalized instructions:', error);
+        return null;
+    }
+}
+
+/**
+ * Real-time learning from user interactions
+ */
+function trackResponseQuality(responseId, sessionId, query, response, confidence, retrievalInfo) {
+    const qualityMetrics = {
+        responseId,
+        sessionId,
+        query,
+        response,
+        confidence,
+        retrievalInfo,
+        timestamp: Date.now(),
+        qualityScore: calculateResponseQuality(query, response, confidence, retrievalInfo),
+        userFeedback: null // Will be updated when user provides feedback
+    };
+    
+    responseQualityTracker.set(responseId, qualityMetrics);
+    
+    // Cleanup old tracking data (keep last 1000 responses)
+    if (responseQualityTracker.size > 1000) {
+        const oldestEntries = Array.from(responseQualityTracker.entries())
+            .sort((a, b) => a[1].timestamp - b[1].timestamp)
+            .slice(0, responseQualityTracker.size - 1000);
+        
+        oldestEntries.forEach(([id]) => responseQualityTracker.delete(id));
+    }
+}
+
+function calculateResponseQuality(query, response, confidence, retrievalInfo) {
+    let qualityScore = 0;
+    
+    // Base score from confidence
+    qualityScore += confidence * 0.4;
+    
+    // Score from retrieval quality
+    if (retrievalInfo && retrievalInfo.bestSimilarity) {
+        qualityScore += retrievalInfo.bestSimilarity * 0.3;
+    }
+    
+    // Score from response characteristics
+    const responseLength = response.length;
+    const queryLength = query.length;
+    
+    // Penalize very short responses to long queries
+    if (queryLength > 50 && responseLength < 100) {
+        qualityScore -= 0.1;
+    }
+    
+    // Boost for comprehensive responses to complex queries
+    if (queryLength > 100 && responseLength > 200) {
+        qualityScore += 0.1;
+    }
+    
+    // Check for helpful phrases
+    const helpfulPhrases = [
+        'let me help',
+        'i can assist',
+        'here\'s how',
+        'to do this',
+        'you can',
+        'the solution is'
+    ];
+    
+    const helpfulCount = helpfulPhrases.filter(phrase => 
+        response.toLowerCase().includes(phrase)
+    ).length;
+    
+    qualityScore += Math.min(helpfulCount * 0.05, 0.15);
+    
+    return Math.max(0, Math.min(1, qualityScore));
+}
+
+/**
+ * ML-based knowledge base optimization
+ */
+function optimizeKnowledgeBase() {
+    if (!knowledgeBase || knowledgeBase.chunks.length === 0) {
+        return;
+    }
+    
+    try {
+        // Analyze chunk performance
+        const chunkPerformance = analyzeChunkPerformance();
+        
+        // Identify low-quality chunks
+        const lowQualityChunks = identifyLowQualityChunks(chunkPerformance);
+        
+        // Suggest improvements
+        const improvements = suggestKnowledgeBaseImprovements(chunkPerformance, lowQualityChunks);
+        
+        console.log(`Knowledge base optimization: ${improvements.length} suggestions generated`);
+        
+        return improvements;
+        
+    } catch (error) {
+        console.error('Error optimizing knowledge base:', error);
+        return [];
+    }
+}
+
+function analyzeChunkPerformance() {
+    const chunkStats = new Map();
+    
+    // Initialize stats for all chunks
+    knowledgeBase.chunks.forEach(chunk => {
+        chunkStats.set(chunk.id, {
+            chunk,
+            retrievalCount: 0,
+            avgSimilarity: 0,
+            avgQualityScore: 0,
+            lastUsed: null,
+            userFeedback: []
+        });
+    });
+    
+    // Analyze historical usage
+    responseQualityTracker.forEach(metrics => {
+        if (metrics.retrievalInfo && metrics.retrievalInfo.chunks) {
+            metrics.retrievalInfo.chunks.forEach(chunkResult => {
+                const chunkId = chunkResult.chunk.id;
+                if (chunkStats.has(chunkId)) {
+                    const stats = chunkStats.get(chunkId);
+                    stats.retrievalCount++;
+                    stats.avgSimilarity = (stats.avgSimilarity + chunkResult.similarity) / 2;
+                    stats.avgQualityScore = (stats.avgQualityScore + metrics.qualityScore) / 2;
+                    stats.lastUsed = Math.max(stats.lastUsed || 0, metrics.timestamp);
+                }
+            });
+        }
+    });
+    
+    return chunkStats;
+}
+
+function identifyLowQualityChunks(chunkPerformance) {
+    const lowQualityThreshold = 0.3;
+    const lowUsageThreshold = 5;
+    const stalenessThreshold = 30 * 24 * 60 * 60 * 1000; // 30 days
+    
+    const lowQualityChunks = [];
+    
+    chunkPerformance.forEach((stats, chunkId) => {
+        const isLowQuality = stats.avgQualityScore < lowQualityThreshold && stats.retrievalCount > 10;
+        const isUnused = stats.retrievalCount < lowUsageThreshold;
+        const isStale = stats.lastUsed && (Date.now() - stats.lastUsed) > stalenessThreshold;
+        
+        if (isLowQuality || isUnused || isStale) {
+            lowQualityChunks.push({
+                chunkId,
+                stats,
+                issues: {
+                    lowQuality: isLowQuality,
+                    unused: isUnused,
+                    stale: isStale
+                }
+            });
+        }
+    });
+    
+    return lowQualityChunks;
+}
+
+function suggestKnowledgeBaseImprovements(chunkPerformance, lowQualityChunks) {
+    const improvements = [];
+    
+    // Suggest removing or updating low-quality chunks
+    lowQualityChunks.forEach(({ chunkId, stats, issues }) => {
+        if (issues.unused && stats.retrievalCount === 0) {
+            improvements.push({
+                type: 'remove',
+                chunkId,
+                reason: 'Never retrieved - likely irrelevant or duplicate',
+                priority: 'low'
+            });
+        } else if (issues.lowQuality) {
+            improvements.push({
+                type: 'rewrite',
+                chunkId,
+                reason: `Low quality score (${stats.avgQualityScore.toFixed(2)}) despite frequent use`,
+                priority: 'high',
+                suggestion: 'Consider rewriting for clarity and completeness'
+            });
+        } else if (issues.stale) {
+            improvements.push({
+                type: 'review',
+                chunkId,
+                reason: 'Not retrieved recently - may be outdated',
+                priority: 'medium',
+                suggestion: 'Review and update if necessary'
+            });
+        }
+    });
+    
+    // Identify content gaps
+    const queryTypes = new Map();
+    responseQualityTracker.forEach(metrics => {
+        if (metrics.confidence < 0.3) { // Low confidence responses indicate gaps
+            const queryType = classifyQuery(metrics.query);
+            const count = queryTypes.get(queryType) || 0;
+            queryTypes.set(queryType, count + 1);
+        }
+    });
+    
+    // Suggest new content for frequent low-confidence queries
+    queryTypes.forEach((count, queryType) => {
+        if (count > 5) {
+            improvements.push({
+                type: 'add_content',
+                queryType,
+                reason: `${count} low-confidence responses for ${queryType} queries`,
+                priority: 'high',
+                suggestion: `Add comprehensive content about ${queryType}`
+            });
+        }
+    });
+    
+    return improvements.sort((a, b) => {
+        const priorityOrder = { high: 3, medium: 2, low: 1 };
+        return priorityOrder[b.priority] - priorityOrder[a.priority];
+    });
+}
+
+function classifyQuery(query) {
+    const queryLower = query.toLowerCase();
+    
+    if (queryLower.includes('how') || queryLower.includes('what') || queryLower.includes('why')) {
+        return 'informational';
+    } else if (queryLower.includes('when') || queryLower.includes('where')) {
+        return 'locational';
+    } else if (queryLower.includes('contact') || queryLower.includes('support')) {
+        return 'support';
+    } else if (queryLower.includes('price') || queryLower.includes('cost')) {
+        return 'pricing';
+    } else {
+        return 'general';
+    }
+}
+
+// Cleanup function for memory management
+function cleanupMemory() {
+    const oneHourAgo = Date.now() - (60 * 60 * 1000);
+    const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
+    
+    // Cleanup conversation contexts
+    for (const [sessionId, context] of conversationContexts.entries()) {
+        if (context.lastActivity < oneHourAgo) {
+            conversationContexts.delete(sessionId);
+        }
+    }
+    
+    // Cleanup conversation memory
+    for (const [sessionId, memory] of conversationMemory.entries()) {
+        if (memory.lastActivity < oneHourAgo) {
+            conversationMemory.delete(sessionId);
+        }
+    }
+    
+    // Cleanup old response tracking data
+    for (const [responseId, metrics] of responseQualityTracker.entries()) {
+        if (metrics.timestamp < oneDayAgo) {
+            responseQualityTracker.delete(responseId);
+        }
+    }
+}
+
+// Run cleanup every 30 minutes
+setInterval(cleanupMemory, 30 * 60 * 1000);
+
+// Export for use in contribution endpoint and other modules
 module.exports.addUserContribution = addUserContribution;
 module.exports.generateEmbedding = generateEmbedding;
 module.exports.ensureKnowledgeBase = ensureKnowledgeBase;
+module.exports.getOrCreateConversationContext = getOrCreateConversationContext;
+module.exports.analyzeQuery = analyzeQuery;
+module.exports.performContextAwareRetrieval = performContextAwareRetrieval;
+module.exports.performanceMonitor = performanceMonitor;
+module.exports.conversationContexts = conversationContexts;
+module.exports.embeddingCache = embeddingCache;
+module.exports.updateUserProfile = updateUserProfile;
+module.exports.trackResponseQuality = trackResponseQuality;
+module.exports.optimizeKnowledgeBase = optimizeKnowledgeBase;
+module.exports.getPersonalizedResponseInstructions = getPersonalizedResponseInstructions;
