@@ -109,4 +109,4 @@ Contribute knowledge to the system.
 For questions or issues:
 - Create an issue in this repository
 - Email: coryjanowski@gmail.com
-- Check the knowledge base in the chat interface# ragzzy
+- Check the knowledge base in the chat interface
