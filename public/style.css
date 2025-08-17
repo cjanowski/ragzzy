@@ -1291,6 +1291,22 @@ body {
         font-size: 0.9rem;
         border-radius: 16px;
         line-height: 1.5;
+        /* Better contrast on mobile */
+        color: #111827 !important;
+        background: rgba(255, 255, 255, 0.9) !important;
+        font-weight: 500;
+    }
+
+    .bot-message .message-text {
+        background: rgba(255, 255, 255, 0.85) !important;
+        border: 1px solid rgba(139, 92, 246, 0.3) !important;
+        color: #111827 !important;
+    }
+
+    .user-message .message-text {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%) !important;
+        color: #ffffff !important;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
     }
 
     .input-container {
@@ -1305,11 +1321,14 @@ body {
     }
 
     #messageInput {
-        font-size: 1rem;
+        font-size: 16px;
         min-height: 44px;
         max-height: 120px;
         /* Disable resize on mobile */
         resize: none;
+        /* Prevent zoom on iOS */
+        -webkit-text-size-adjust: 100%;
+        transform: translateZ(0);
     }
 
     .send-button {
@@ -1452,7 +1471,53 @@ body {
         /* Prevent iOS zoom */
         font-size: 16px;
         -webkit-appearance: none;
+        -webkit-text-size-adjust: 100%;
         border-radius: 0;
+        /* Force hardware acceleration */
+        transform: translateZ(0);
+        -webkit-transform: translateZ(0);
+    }
+
+    /* Prevent zoom after form submission */
+    .input-form {
+        -webkit-text-size-adjust: 100%;
+    }
+
+    /* Better mobile scrolling */
+    .messages-container {
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior-y: contain;
+    }
+}
+
+/* Additional mobile zoom prevention */
+@media (max-width: 768px) {
+    /* Prevent zoom on any input focus */
+    input, textarea, select {
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100%;
+        transform: translateZ(0);
+    }
+
+    /* Ensure message text is readable */
+    .message-time {
+        color: rgba(17, 24, 39, 0.7) !important;
+    }
+
+    .welcome-message .message-text {
+        color: #111827 !important;
+        background: rgba(255, 255, 255, 0.9) !important;
+    }
+
+    /* Better input placeholder visibility */
+    #messageInput::placeholder {
+        color: rgba(17, 24, 39, 0.5) !important;
+    }
+
+    /* Prevent text selection issues */
+    .message-text {
+        -webkit-user-select: text;
+        user-select: text;
     }
 }
 

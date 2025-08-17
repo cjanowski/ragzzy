@@ -285,6 +285,17 @@ class RagzzyChatApp {
         this.updateCharCounter();
         this.toggleSendButton();
 
+        // Blur input on mobile to prevent zoom issues
+        if (window.innerWidth <= 768) {
+            this.elements.messageInput.blur();
+            // Small delay then refocus for better UX
+            setTimeout(() => {
+                if (window.innerWidth <= 768) {
+                    this.elements.messageInput.focus();
+                }
+            }, 100);
+        }
+
         // Show typing indicator and progress
         this.showTypingIndicator();
         this.showProgress(true);
