@@ -91,14 +91,7 @@ body {
     }
 }
 
-@media (max-width: 768px) {
-    .app-container {
-        height: 95vh;
-        width: 98%;
-        margin: 2.5vh auto;
-        border-radius: 20px;
-    }
-}
+/* Mobile styles moved to consolidated section below */
 
 /* Header Styles */
 .chat-header {
@@ -1243,18 +1236,25 @@ body {
     padding: 0.5rem 1rem;
 }
 
-/* Responsive Design */
+/* Mobile Responsive Design */
 @media (max-width: 768px) {
     .app-container {
-        height: 95vh;
-        width: 98%;
-        margin: 2.5vh auto;
-        border-radius: 20px;
+        height: 100vh;
+        width: 100%;
+        margin: 0;
+        border-radius: 0;
+        /* Disable resize on mobile */
+        resize: none;
+        min-width: unset;
+        min-height: unset;
+        max-width: unset;
+        max-height: unset;
     }
 
     .chat-header {
-        border-radius: 20px 20px 0 0;
-        padding: 1.25rem 1.5rem;
+        border-radius: 0;
+        padding: 1rem 1.25rem;
+        padding-top: calc(1rem + env(safe-area-inset-top));
     }
 
     .header-content {
@@ -1263,54 +1263,198 @@ body {
     }
 
     .header-text h1 {
-        font-size: 1.5rem;
+        font-size: 1.375rem;
     }
 
     .header-subtitle {
-        font-size: 0.85rem;
+        font-size: 0.8rem;
     }
 
     .messages-container {
-        padding: 1.5rem;
+        padding: 1rem;
+        padding-bottom: calc(1rem + env(safe-area-inset-bottom));
     }
 
     .message {
-        gap: 0.75rem;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
     }
 
     .avatar {
-        width: 38px;
-        height: 38px;
-        font-size: 1.125rem;
+        width: 36px;
+        height: 36px;
+        font-size: 1rem;
     }
 
     .message-text {
-        padding: 1rem 1.25rem;
+        padding: 0.875rem 1rem;
         font-size: 0.9rem;
-        border-radius: 18px;
+        border-radius: 16px;
+        line-height: 1.5;
     }
 
     .input-container {
-        padding: 1.25rem 1.5rem;
-        border-radius: 0 0 20px 20px;
+        padding: 1rem;
+        padding-bottom: calc(1rem + env(safe-area-inset-bottom));
+        border-radius: 0;
     }
 
     .input-wrapper {
-        padding: 0.875rem;
-        border-radius: 14px;
+        padding: 0.75rem;
+        border-radius: 12px;
+    }
+
+    #messageInput {
+        font-size: 1rem;
+        min-height: 44px;
+        max-height: 120px;
+        /* Disable resize on mobile */
+        resize: none;
     }
 
     .send-button {
         width: 44px;
         height: 44px;
-        border-radius: 10px;
+        border-radius: 12px;
+        flex-shrink: 0;
     }
 
     .input-hints {
         flex-direction: column;
-        gap: 0.5rem;
-        margin-top: 0.75rem;
+        gap: 0.25rem;
+        margin-top: 0.5rem;
+        font-size: 0.7rem;
     }
+
+    /* Hide resize indicator on mobile */
+    .app-container::after {
+        display: none;
+    }
+}
+
+/* Extra small mobile devices (phones in portrait) */
+@media (max-width: 480px) {
+    .chat-header {
+        padding: 0.875rem 1rem;
+        padding-top: calc(0.875rem + env(safe-area-inset-top));
+    }
+
+    .header-text h1 {
+        font-size: 1.25rem;
+    }
+
+    .header-subtitle {
+        font-size: 0.75rem;
+    }
+
+    .messages-container {
+        padding: 0.75rem;
+    }
+
+    .message-text {
+        padding: 0.75rem 0.875rem;
+        font-size: 0.875rem;
+    }
+
+    .input-container {
+        padding: 0.875rem;
+        padding-bottom: calc(0.875rem + env(safe-area-inset-bottom));
+    }
+
+    .input-wrapper {
+        padding: 0.625rem;
+    }
+
+    #messageInput {
+        font-size: 0.9rem;
+    }
+
+    .send-button {
+        width: 40px;
+        height: 40px;
+    }
+
+    .input-hints {
+        font-size: 0.65rem;
+    }
+}
+
+/* Landscape mobile optimization */
+@media (max-width: 768px) and (orientation: landscape) {
+    .app-container {
+        height: 100vh;
+    }
+
+    .chat-header {
+        padding: 0.75rem 1rem;
+        padding-top: calc(0.75rem + env(safe-area-inset-top));
+    }
+
+    .header-text h1 {
+        font-size: 1.125rem;
+    }
+
+    .header-subtitle {
+        font-size: 0.7rem;
+    }
+
+    .messages-container {
+        padding: 0.75rem;
+    }
+
+    .input-container {
+        padding: 0.75rem;
+        padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
+    }
+}
+
+/* Touch-friendly improvements */
+@media (hover: none) and (pointer: coarse) {
+    /* Larger touch targets */
+    .send-button {
+        min-width: 48px;
+        min-height: 48px;
+    }
+
+    /* Better touch feedback */
+    .message-text {
+        -webkit-tap-highlight-color: rgba(102, 126, 234, 0.1);
+    }
+
+    .input-wrapper {
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    /* Prevent zoom on input focus */
+    #messageInput {
+        font-size: 16px;
+    }
+
+    /* Better scrolling on mobile */
+    .messages-container {
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior: contain;
+    }
+}
+
+/* iOS Safari specific fixes */
+@supports (-webkit-touch-callout: none) {
+    .app-container {
+        height: 100vh;
+        height: -webkit-fill-available;
+    }
+
+    .input-container {
+        padding-bottom: calc(1rem + env(safe-area-inset-bottom, 20px));
+    }
+
+    #messageInput {
+        /* Prevent iOS zoom */
+        font-size: 16px;
+        -webkit-appearance: none;
+        border-radius: 0;
+    }
+}
 
     /* Enhanced Modal Styles for Mobile */
     .modal-overlay {
